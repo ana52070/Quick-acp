@@ -1,0 +1,40 @@
+{
+  "name": "quick-acp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ACP agent that bridges AWS Quick (Quickwork) Claude quota to standard ACP clients",
+  "bin": {
+    "quick-acp": "dist/main.js",
+    "quick-acp-login": "dist/login-cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node --experimental-strip-types src/main.ts",
+    "start": "node dist/main.js",
+    "login": "node dist/login-cli.js",
+    "mcp": "node dist/mcp-main.js",
+    "probe": "node dist/probe.js",
+    "smoke": "node dist/acp-smoke.js",
+    "mcp-smoke": "node dist/mcp-smoke.js",
+    "e2e": "node dist/e2e.js",
+    "e2e:no-outpost": "node dist/no-outpost-e2e.js",
+    "e2e:fresh": "node dist/fresh-machine-e2e.js",
+    "test:tools": "node dist/inject-turn-test.js",
+    "doctor": "node dist/doctor.js",
+    "verify": "npm run build && npm run probe && npm run smoke && npm run mcp-smoke",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@zed-industries/agent-client-protocol": "^0.4.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  }
+}
