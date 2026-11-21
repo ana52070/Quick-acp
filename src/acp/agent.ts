@@ -44,7 +44,7 @@ import {
   type TurnAttachment,
 } from '../quick/session.js';
 import { defaultPolicy, toolDefs, ToolExecutor, type ToolDef } from '../tools/registry.js';
-import { resolveToolMode, runWithInjectedTools, setupMcpStrategy, type ToolMode } from '../tools/strategies.js';
+import { resolveToolMode, runWithInjectedTools, type ToolMode } from '../tools/strategies.js';
 
 /** ACP protocol revision this agent implements. */
 const PROTOCOL_VERSION = 1;
@@ -69,7 +69,6 @@ export class QuickAcpAgent implements Agent {
   private readonly executor: ToolExecutor;
   private readonly workspaceRoot: string;
   private readonly policy: ReturnType<typeof defaultPolicy>;
-  private mcpRegistration: { ok: boolean; error?: string; needsEnable?: boolean } | null = null;
   private conn: AgentSideConnection | null = null;
 
   constructor(opts: { workspaceRoot?: string } = {}) {
@@ -79,64 +78,6 @@ export class QuickAcpAgent implements Agent {
     this.tools = toolDefs(policy);
     this.executor = new ToolExecutor(policy);
     this.policy = policy;
-  }
-
-  /**
-   * Register our MCP server into Quick's outpost so the model can call our
-   * tools natively.
-   *
-   * Done once per process, lazily, because it needs a reachable outpost and the
-   * instance token. If it fails we say exactly which step broke and why, and
-   * the caller can decide whether to fall back to inject mode.
-   */
-  async ensureMcpRegistered(): Promise<{ ok: boolean; error?: string; needsEnable?: boolean }> {
-    if (this.toolMode !== 'mcp') return { ok: true };
-    if (this.mcpRegistration) return this.mcpRegistration;
-
-    const scriptPath = process.env.QUICK_ACP_MCP_SCRIPT ?? resolveMcpScriptPath();
-    const result = await setupMcpStrategy({
-      serverName: process.env.QUICK_ACP_MCP_NAME ?? 'quick-acp-tools',
-      scriptPath,
-      workspaceRoot: this.workspaceRoot,
-      allowShell: this.policy.allowShell,
-      // Never replace on the automatic path: the user enables the server by hand
-      // once, and a remove+add would throw that away and reset it to disabled.
-      replace: false,
-    });
-
-    if (!result.ok) {
-      // A registered-but-disabled server is the expected resting state, not a
-      // bug: enabling it needs a click in Quick's UI (and, on a machine without
-      // the desktop app, an org-permission gate that never resolves).
-      if (result.step === 'toggle' && result.serverId) {
-        this.mcpRegistration = {
-          ok: false,
-          needsEnable: true,
-          error:
-            `MCP server "${process.env.QUICK_ACP_MCP_NAME ?? 'quick-acp-tools'}" is registered ` +
-            `(id ${result.serverId}) but not yet enabled. Enable it once in Quick -> Settings -> ` +
-            'MCP servers; that setting persists. Tools currently run through the prompt-injected ' +
-            'fallback; set QUICK_ACP_TOOL_MODE=inject to silence this message.',
-        };
-        console.error(`[quick-acp] ${this.mcpRegistration.error}`);
-        return this.mcpRegistration;
-      }
-
-      this.mcpRegistration = {
-        ok: false,
-        error: `MCP registration failed at "${result.step}": ${result.error ?? 'unknown'}`,
-      };
-      console.error(`[quick-acp] ${this.mcpRegistration.error}`);
-      console.error(
-        '[quick-acp] falling back to prompt-injected tools (one extra gateway turn per tool call). ' +
-          'This is expected on machines without the Quick desktop app.',
-      );
-      return this.mcpRegistration;
-    }
-
-    console.error(`[quick-acp] MCP server registered and enabled (id ${result.serverId})`);
-    this.mcpRegistration = { ok: true };
-    return this.mcpRegistration;
   }
 
   /** Called by main once the connection exists, so we can emit updates. */
@@ -149,13 +90,6 @@ export class QuickAcpAgent implements Agent {
   // -------------------------------------------------------------------------
 
   async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
-    // Register tools with Quick as early as possible: an ACP client asks for
-    // capabilities before it ever creates a session, and a slow first prompt
-    // is much more noticeable than a slow initialize.
-    if (this.toolMode === 'mcp') {
-      void this.ensureMcpRegistered();
-    }
-
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentCapabilities: {
@@ -319,24 +253,9 @@ export class QuickAcpAgent implements Agent {
     userText: string,
     attachments: TurnAttachment[],
   ): Promise<{ cancelled: boolean; text: string }> {
-    // mcp mode: Quick's model calls our tools natively, so the turn is a plain
-    // gateway turn. No prompt contract, no parsing, no extra rounds.
-    //
-    // BUT only if registration actually succeeded. Registering needs the
-    // desktop app (an Ed25519-signed toggle plus an org-permission gate), so on
-    // a clean machine it fails — and without this check the turn would run with
-    // NO tools at all and the model would simply claim it cannot run commands,
-    // which reads like a model limitation rather than a configuration state.
-    // Falling back to inject keeps the tools working at the cost of extra turns.
-    const useMcp =
-      this.toolMode === 'mcp' && this.mcpRegistration !== null && this.mcpRegistration.ok;
-
-    if (useMcp) {
-      const r = await this.oneGatewayTurn(session, userText, attachments);
-      return { cancelled: r.cancelled, text: r.text };
-    }
-
-    // inject mode (explicit, or the automatic fallback).
+    // Tools are advertised in the prompt and driven by this loop. One extra
+    // gateway turn per tool call is the price of needing nothing but the
+    // gateway; the native MCP alternative lives on the `mcp-native` branch.
     const result = await runWithInjectedTools({
       userText,
       tools: this.tools,
@@ -487,24 +406,6 @@ export class QuickAcpAgent implements Agent {
     this.quickSession = await resolveSession();
     return this.quickSession;
   }
-}
-
-/**
- * Resolve the built MCP server ENTRY POINT that sits next to this module.
- *
- * This must be `dist/mcp-main.js`, not `dist/tools/mcp-server.js`:
- * `mcp-server.js` only exports the handler functions and has no top-level
- * `main()`, so spawning it prints nothing and exits 0. Registering that path
- * gives Quick a server that starts successfully and answers no requests — the
- * worst failure mode, because nothing reports an error.
- *
- * Verified by hand: piping an MCP `initialize` frame into each build
- *   dist/tools/mcp-server.js  -> no output, exit 0
- *   dist/mcp-main.js          -> {"jsonrpc":"2.0","id":1,"result":{...}}
- */
-function resolveMcpScriptPath(): string {
-  const here = fileURLToPath(new URL('.', import.meta.url));
-  return join(here, '..', 'mcp-main.js');
 }
 
 /** Flatten ACP prompt content blocks into text + attachments. */

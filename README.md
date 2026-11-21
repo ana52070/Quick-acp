@@ -148,7 +148,7 @@ Quick 自己的客户端就是个**标准 OAuth 授权码 + PKCE 公共客户端
 |---|---|---|
 | `QUICK_ACP_WORKSPACE` | 当前目录 | 所有工具被禁锢在这个目录里 |
 | `QUICK_ACP_ALLOW_SHELL` | `0` | 开 shell 执行。默认关 |
-| `QUICK_ACP_TOOL_MODE` | `inject` | `inject`（无依赖）或 `mcp`（需桌面端） |
+| `QUICK_ACP_TOOL_MODE` | 忽略 | 原生 MCP 在 `mcp-native` 分支，这里始终用 prompt 注入 |
 | `QUICK_ACP_FRAMING` | `json-base64` | 帧格式。**默认就是对的**，别乱改：`cbor` 会让服务端静默丢消息 |
 | `QUICK_ACP_START_URL` | unset | 登录用的 portal 地址，等价于 `--start-url` |
 | `QUICK_ACP_TENANT_URL` | 自动发现 | 网关 host。登录后自动从 `profiles.json` / outpost 找回 |
@@ -224,13 +224,9 @@ Quick 自己**已经有**文件读写/搜索/`apply_patch`（`desktop_windows.ya
 - 所有路径被禁锢在 `QUICK_ACP_WORKSPACE` 内，`../` 或绝对路径越界一律拒绝
 - 输出有大小上限，写入有大小上限，命令有超时
 
----
+### 工作方式
 
-## 两种工具模式
-
-### `inject`（默认，无依赖）
-
-把工具定义写进 prompt，让模型输出带标记的代码块，本地执行后把结果当下一轮用户消息喂回去。
+把工具定义写进 prompt，让模型输出带标记的代码块，本地执行后把结果当下一轮用户消息喂回去：
 
 ```quick-tool-call
 {"name": "shell_run", "arguments": {"command": "dir"}}
@@ -243,57 +239,11 @@ Quick 自己**已经有**文件读写/搜索/`apply_patch`（`desktop_windows.ya
 
 实测（`npm run test:tools`）：模型会规范输出这个块，工具本地执行，然后给出最终答案。
 
-### `mcp`（可选，需要桌面端）
+### 关于原生 MCP
 
-在本机跑一个 MCP server，通过 outpost 的 `/local/mcp/add` 注册进 Quick，让 Quick 的模型**原生调用**。
+理论上可以让模型**原生调用**工具（零额外轮次、不依赖模型写 JSON）。这条路实现在 **`mcp-native` 分支**，没有合并进来，原因很实在：启用本地 MCP server 要过两道门，**都在 Quick 桌面端**。
 
-- ✅ 零额外轮次
-- ✅ 不依赖模型写 JSON
-- ❌ **需要 Quick 桌面端**，见下
-
-开启方式：`QUICK_ACP_TOOL_MODE=mcp`。如果注册不成，会自动回退到 `inject`（不会静默丢工具）。
-
-**注册接口（从渲染层 `Qc()` 逆向）：**
-```
-GET  {outpost}/local/mcp/list
-POST {outpost}/local/mcp/add      { id, name, command, args[], url:"", description,
-                                    startupTimeout, envVars[{key,value}], hostOnOutpost }
-POST {outpost}/local/mcp/toggle   { id, enabled, nonce, signature, timestamp, jti,
-                                    hashVersion, outpostId }
-POST {outpost}/local/mcp/remove   { id }
-POST {outpost}/local/mcp/reload   { id }
-```
-
-**实测出来的坑：**
-- `envVars` / `headers` **为空时必须整个省略**，传 `[]` 会被拒
-- `id` 是必填
-- MCP server 入口必须是 `dist/mcp-main.js`，不是 `dist/tools/mcp-server.js`（后者只导出函数，被 spawn 后静默退出）
-
-### 为什么 MCP 不是默认
-
-启用本地 MCP server 要过**两道门**，都在桌面端：
-
-**第一道：组织权限**
-```
-HTTP 503  {"errorCode": "permissions_pending",
-           "error": "Local MCP creation and modification is temporarily unavailable
-                     while your organization's permissions are loading."}
-```
-这是全局写门——`add`/`toggle`/`remove`/`reload` 全挡，连不存在的 id 也一样报。`GET list` 是 200，因为读不设门。连续重试 64 秒不会自愈。
-
-桌面端日志里能看到它正常解除的过程：
-```
-18:37:29  [OutpostServer] admin controls unresolved after 30.0s; MCP mutations remain pending
-18:37:47  [OutpostBoot]   local_mcp_connect gate=resolved gate_wait_ms=0
-```
-所以这门**会解除**，但依赖组织策略解析完成，而那是桌面端登录后才做的事。
-
-**第二道：命令确认**
-`toggle` 要 `{nonce, signature, timestamp, jti, hashVersion, outpostId}`。签名由 Electron 主进程在原生确认对话框之后用 Ed25519 生成，私钥每次启动现生成、只在主进程内存里。
-
-**注意**：主进程源码把这两件事分得很清楚——`nonce`（v1 哈希）给本地 outpost 校验，`signature`（v2 哈希）给远端 cell。渲染层同时发送全部字段，不能推出本地 HTTP 接口会校验全部字段。所以准确说法是：**当前桥接没有实现独立的权限初始化与确认链**，而不是"技术上不可能"。
-
-想深挖这条路的，方向是：独立的 device-tool relay / 宿主，自己实现权限初始化和用户确认，然后接收 Quick 下发的 `tool_call` 并回传 `tool_result`。执行通道是真实存在的（`startup-*.js` 里 `if (r.type === 'tool_call') { Yx(...) }`），缺的是自定义工具 schema 的发布接口。
+参考：想自己研究的话，`mcp-native` 分支里有完整的逆向记录和待解决的三个环节。
 
 ---
 
@@ -324,20 +274,17 @@ src/
     gateway-contract.ts 实测出来的网关常量（有测试断言）
   tools/
     registry.ts      工具定义、工作区禁锢、执行
-    mcp-server.ts    MCP server（stdio JSON-RPC）
-    mcp-register.ts  注册进 Quick outpost
-    strategies.ts    mcp / inject 两种策略
+    strategies.ts    prompt 注入式工具循环
   acp/agent.ts       ACP Agent 实现
   main.ts            ACP 入口
   login-cli.ts       登录命令行
-  mcp-main.ts        MCP server 入口（Quick 会 spawn 它）
-  probe.ts           27 项编解码/工具检查
+  probe.ts           编解码 / 工具 / 工具契约检查
   acp-smoke.ts       5 项 ACP 接线检查
-  mcp-smoke.ts       7 项 MCP server 检查
-  e2e.ts             端到端（走 outpost）
+  e2e.ts             端到端（ACP → Quick → 模型 → ACP）
   no-outpost-e2e.ts  端到端（不走 outpost）
   fresh-machine-e2e.ts 端到端（模拟全新机器，纯浏览器登录）
   inject-turn-test.ts  多轮对话 + 工具循环回归（这两个都曾是真 bug）
+  concurrent-test.ts   两个会话并发，检查不串话
 ```
 
 ---

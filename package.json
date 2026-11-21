@@ -1,9 +1,20 @@
 {
   "name": "quick-acp",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "ACP agent that bridges AWS Quick (Quickwork) Claude quota to standard ACP clients",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ana52070/Quick-acp.git"
+  },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "quick",
+    "quickwork",
+    "claude"
+  ],
   "bin": {
     "quick-acp": "dist/main.js",
     "quick-acp-login": "dist/login-cli.js"
@@ -16,16 +27,15 @@
     "dev": "node --experimental-strip-types src/main.ts",
     "start": "node dist/main.js",
     "login": "node dist/login-cli.js",
-    "mcp": "node dist/mcp-main.js",
     "probe": "node dist/probe.js",
     "smoke": "node dist/acp-smoke.js",
-    "mcp-smoke": "node dist/mcp-smoke.js",
     "e2e": "node dist/e2e.js",
     "e2e:no-outpost": "node dist/no-outpost-e2e.js",
     "e2e:fresh": "node dist/fresh-machine-e2e.js",
     "test:tools": "node dist/inject-turn-test.js",
+    "test:concurrent": "node dist/concurrent-test.js",
     "doctor": "node dist/doctor.js",
-    "verify": "npm run build && npm run probe && npm run smoke && npm run mcp-smoke",
+    "verify": "npm run build && npm run probe && npm run smoke",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

@@ -1,62 +1,58 @@
 /**
- * Two tool-invocation strategies, selected at runtime.
+ * The tool-invocation strategy.
  *
  * The Quick gateway gives a caller no tool channel: the model's tools belong to
- * Quick's own agent loop. Two mechanisms can bridge that, and — after testing
- * both against the live outpost — only one of them actually works without the
- * desktop app installed.
+ * Quick's own agent loop. Bridging that takes one of two mechanisms, and this
+ * branch ships the only one that works without the desktop app installed.
  *
- *   "inject"  (DEFAULT — works everywhere)
+ *   "inject"  (this branch)
  *     Advertise the tools in the prompt as a JSON contract, parse a fenced block
  *     out of the reply, execute locally, feed the result back as the next user
  *     turn. Costs one extra turn per tool call and depends on the model
  *     complying, but needs nothing but the gateway: no outpost, no instance
  *     token, no Electron shell, no desktop app.
  *
- *   "mcp"     (opt-in — requires the desktop app)
- *     Run an MCP server locally and register it into Quick over the outpost's
- *     `/local/mcp/add`, so Quick's model calls these tools natively. Zero extra
- *     turns and no format compliance problem — strictly better WHEN IT WORKS.
+ * WHY THERE IS NO `mcp` MODE HERE
+ * ------------------------------
+ * Running an MCP server locally and registering it into Quick over
+ * `/local/mcp/add` gives the model native tool calls: zero extra turns and no
+ * format-compliance problem. It is strictly better — when it works — but
+ * enabling a local MCP server is gated twice by the desktop app:
  *
- * WHY MCP IS NOT THE DEFAULT
- * --------------------------
- * Enabling a local MCP server is gated twice, and both gates live in the
- * desktop app:
+ *   1. `/local/mcp/add|toggle|remove|reload` answer HTTP 503
+ *      `permissions_pending` until the app has pulled the organisation's
+ *      permissions. A global write gate: a brand-new non-existent id gets the
+ *      same answer, and it does not clear on retry. Reads (`list`) stay 200.
  *
- *   1. `/local/mcp/toggle` needs {nonce, signature, timestamp, jti,
- *      hashVersion, outpostId}. The signature is Ed25519, produced by Electron's
- *      MAIN process after a native OS confirmation dialog. The private key is
- *      generated per boot, held in main-process memory, and never exposed;
- *      `mcpAttestationGuard.js` explicitly refuses to relay the upload route to
- *      the renderer ("only a renderer forge").
+ *   2. `toggle` additionally needs an Ed25519-signed confirmation
+ *      {nonce, signature, timestamp, jti, hashVersion, outpostId} produced by
+ *      Electron's main process after a native OS dialog.
  *
- *   2. `/local/mcp/add|toggle|remove|reload` currently return HTTP 503
- *      `permissions_pending` — "Local MCP creation and modification is
- *      temporarily unavailable while your organization's permissions are
- *      loading." This is a GLOBAL write gate (a brand-new non-existent id gets
- *      the same answer), it does not clear on retry, and `GET /local/mcp/list`
- *      stays 200 because reads are not gated. In practice the permission has to
- *      be pulled by a signed-in desktop app.
- *
- * So "mcp" is opt-in: it is worth turning on for users who run the desktop app,
- * and pointless for everyone else. Setting QUICK_ACP_TOOL_MODE=mcp on a machine
- * without it produces a clear diagnostic instead of a silent capability gap.
+ * Both belong to the desktop app, so `mcp` mode would be dead code on a clean
+ * machine — the very machine this project targets. It is kept on the
+ * `mcp-native` branch, together with notes on what a desktop-free version would
+ * need.
  */
 
 import type { ToolDef, ToolExecutor, ToolResult } from './registry.js';
 
-export type ToolMode = 'mcp' | 'inject';
+export type ToolMode = 'inject';
 
 /**
  * Which strategy to use.
  *
- * Default is "inject" because it is the only one that works on a clean machine.
- * QUICK_ACP_TOOL_MODE=mcp opts into the native path once the user has the
- * desktop app running and has enabled the server in its UI.
+ * Only one exists on this branch. QUICK_ACP_TOOL_MODE is still read so a config
+ * copied from the `mcp-native` branch does not fail loudly; the value is ignored.
  */
 export function resolveToolMode(): ToolMode {
-  const raw = (process.env.QUICK_ACP_TOOL_MODE ?? 'inject').toLowerCase();
-  return raw === 'mcp' ? 'mcp' : 'inject';
+  const raw = (process.env.QUICK_ACP_TOOL_MODE ?? '').toLowerCase();
+  if (raw === 'mcp') {
+    console.error(
+      '[quick-acp] QUICK_ACP_TOOL_MODE=mcp ignored: native MCP lives on the ' +
+        '"mcp-native" branch (it needs the Quick desktop app). Using inject.',
+    );
+  }
+  return 'inject';
 }
 
 // ---------------------------------------------------------------------------
@@ -214,29 +210,8 @@ export async function runWithInjectedTools(opts: {
 // ---------------------------------------------------------------------------
 // Strategy: mcp
 // ---------------------------------------------------------------------------
-
-/**
- * Point Quick at this bridge's MCP server.
- *
- * The server itself lives in mcp-server.ts and is spawned by Quick; this
- * function only performs the registration handshake and reports precisely
- * which step failed, because a half-done registration is worse than none:
- * an added-but-disabled server looks present in Quick's UI but provides no
- * tools, which is confusing to debug later.
- */
-export async function setupMcpStrategy(opts: {
-  serverName: string;
-  scriptPath: string;
-  workspaceRoot: string;
-  allowShell: boolean;
-  replace?: boolean;
-}): Promise<{ ok: boolean; serverId?: string; error?: string; step?: string }> {
-  const { registerMcpServer } = await import('./mcp-register.js');
-  return registerMcpServer({
-    name: opts.serverName,
-    scriptPath: opts.scriptPath,
-    workspaceRoot: opts.workspaceRoot,
-    allowShell: opts.allowShell,
-    replace: opts.replace ?? true,
-  });
-}
+//
+// Not present on this branch. The MCP server, its registration handshake, and
+// the notes on what a desktop-free version would need all live on the
+// `mcp-native` branch. Keeping the stub out of the build means `tsc` cannot be
+// satisfied by code that cannot run on a clean machine.

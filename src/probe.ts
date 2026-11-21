@@ -341,28 +341,31 @@ async function main(): Promise<void> {
     assert(on.some((t) => t.name === 'shell_run'), 'shell_run must be present when enabled');
   });
 
-  await check('MCP registration payload matches the outpost contract', async () => {
-    // The outpost requires name/command/args and takes url as "" for stdio.
-    // Assert the shape we build, without touching a live outpost.
-    const { buildRegisterPayload } = await import('./tools/mcp-register.js');
-    const payload = buildRegisterPayload({
-      name: 'quick-acp-tools',
-      scriptPath: '/tmp/mcp-main.js',
-      nodePath: '/usr/bin/node',
-      workspaceRoot: '/tmp/ws',
-      allowShell: true,
-    });
-    eq(payload.name, 'quick-acp-tools', 'name');
-    eq(payload.command, '/usr/bin/node', 'command');
-    eq(payload.args, ['/tmp/mcp-main.js'], 'args');
-    eq(payload.url, '', 'url must be an empty string for stdio, not omitted');
-    assert(Array.isArray(payload.envVars), 'envVars must be an array');
-    const envKeys = (payload.envVars as Array<{ key: string }>).map((e) => e.key);
-    assert(envKeys.includes('QUICK_ACP_WORKSPACE'), 'workspace env must be passed');
-    assert(envKeys.includes('QUICK_ACP_ALLOW_SHELL'), 'shell flag env must be passed');
-    eq(payload.hostOnOutpost, false, 'hostOnOutpost');
-    const st = payload.startupTimeout as number;
-    assert(st >= 5 && st <= 300, `startupTimeout out of the 5..300 range: ${st}`);
+  await check('inject tool contract round-trips through the parser', async () => {
+    // The contract is the whole tool channel on this branch, so prove the
+    // prompt → reply → parse path is self-consistent: what buildToolPrompt
+    // teaches must be exactly what parseToolCall accepts.
+    const { buildToolPrompt, parseToolCall, formatToolResult } = await import('./tools/strategies.js');
+    const tools = toolDefs({ ...defaultPolicy(process.cwd()), allowShell: true });
+    const prompt = buildToolPrompt(tools, process.cwd());
+    assert(prompt.includes('quick-tool-call'), 'prompt must name the fenced marker');
+    assert(prompt.includes('shell_run'), 'prompt must document shell_run');
+    assert(prompt.includes('{'), 'prompt must include the JSON schema');
+
+    const reply = '```quick-tool-call\n{"name":"shell_run","arguments":{"command":"echo hi"}}\n```';
+    const call = parseToolCall(reply);
+    assert(call !== null, 'a well-formed tool call must parse');
+    eq(call!.name, 'shell_run', 'tool name');
+    eq((call!.arguments as Record<string, unknown>)['command'], 'echo hi', 'argument');
+
+    // Prose must NOT be mistaken for a call, or every answer would be executed.
+    eq(parseToolCall('The directory is /tmp.'), null, 'plain prose is not a call');
+    // Malformed JSON must degrade to prose, not throw.
+    eq(parseToolCall('```quick-tool-call\n{not json}\n```'), null, 'bad JSON is not a call');
+
+    const shaped = formatToolResult(call!, { ok: true, content: 'hi\n' } as never);
+    assert(shaped.includes('hi'), 'tool result must carry the output back');
+    assert(shaped.includes('shell_run'), 'tool result must name the tool');
   });
 
   console.log('');
