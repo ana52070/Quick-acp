@@ -19,9 +19,9 @@
  *   - file_list       NEW
  *   - file_search     NEW
  *
- * Every tool is confined to a workspace root and gated by an explicit policy,
- * because an unconfined shell reachable from a model is a remote-code-execution
- * primitive pointed at the user's machine.
+ * Every tool runs on the user's own machine with the user's own privileges. The
+ * only hard block is a deny-list of destructive commands (see below); there is
+ * no folder jail, because a shell that can `cd` anywhere makes one meaningless.
  */
 
 import { spawn } from 'node:child_process';
@@ -66,10 +66,29 @@ export const DEFAULT_SHELL_DENY_PATTERNS: RegExp[] = [
   /\b(curl|wget)\b[^|]*\|\s*(ba|z|k|da)?sh\b/,
 ];
 
+/**
+ * Default policy for a workspace.
+ *
+ * SHELL IS ON BY DEFAULT — this is a deliberate change.
+ *
+ * It started off requiring QUICK_ACP_ALLOW_SHELL=1, on the reasoning that an
+ * unconfined shell is an RCE primitive. But that only holds if the user could
+ * turn it on, and most ACP clients give a custom agent no field for env vars.
+ * So the flag could not be set, shell_run was never advertised, and the model
+ * told the user "I have no tool to run commands" — indistinguishable from a
+ * broken bridge, and that is exactly what happened in practice.
+ *
+ * There is NO workspace jail either. See `resolveInside` for why: shell_run can
+ * reach anywhere the user can, so jailing the file tools while leaving the shell
+ * open buys nothing but broken requests. The deny-list stays, because it blocks
+ * destruction the user would not want regardless of folder.
+ *
+ * `QUICK_ACP_ALLOW_SHELL=0` disables execution outright for anyone who wants it.
+ */
 export function defaultPolicy(workspaceRoot: string): ToolPolicy {
   return {
     workspaceRoot: resolve(workspaceRoot),
-    allowShell: process.env.QUICK_ACP_ALLOW_SHELL === '1',
+    allowShell: process.env.QUICK_ACP_ALLOW_SHELL !== '0',
     shellDenyPatterns: DEFAULT_SHELL_DENY_PATTERNS,
     shellTimeoutMs: 120_000,
     maxOutputBytes: 400_000,
@@ -190,21 +209,22 @@ export class ToolExecutor {
   }
 
   /**
-   * Resolve a caller-supplied path inside the workspace.
-   * Absolute paths are accepted but must still land inside the root; anything
-   * that escapes (via `..`, a symlink target, a different drive) is refused.
+   * Resolve a caller-supplied path.
+   *
+   * NO JAIL — deliberately. This used to refuse anything outside the workspace
+   * root, on the reasoning that an unconfined file tool is dangerous. But
+   * `shell_run` is part of the same tool set and can read and write anywhere the
+   * user can, so the jail only restricted the *convenient* path while leaving
+   * the powerful one wide open. That is a false sense of safety: it stops honest
+   * requests ("read the file I just mentioned in another folder") and stops
+   * nothing a model could do with one shell command.
+   *
+   * A relative path is still resolved against the session's workspace, which is
+   * what makes "the path I picked in the client" work naturally.
    */
   private resolveInside(input: string): string {
     const raw = typeof input === 'string' && input.length > 0 ? input : '.';
-    const abs = isAbsolute(raw) ? resolve(raw) : resolve(this.root, raw);
-    const rel = relative(this.root, abs);
-    if (rel.startsWith('..') || (isAbsolute(rel) && rel !== '')) {
-      throw new Error(`path escapes the workspace root: ${input}`);
-    }
-    if (rel !== '' && rel.split(sep).includes('..')) {
-      throw new Error(`path escapes the workspace root: ${input}`);
-    }
-    return abs;
+    return isAbsolute(raw) ? resolve(raw) : resolve(this.root, raw);
   }
 
   async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {

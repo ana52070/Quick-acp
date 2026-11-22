@@ -172,34 +172,43 @@ async function main() {
         assert(text.includes('file_read'), 'should name the tool');
         assert(text.includes('abc'), 'should include content');
     });
-    // -- 5. workspace jail ---------------------------------------------------
+    // -- 5. path handling ----------------------------------------------------
     const policy = defaultPolicy(process.cwd());
     const executor = new ToolExecutor(policy);
-    await check('workspace jail: escaping path is refused', async () => {
-        const r = await executor.execute('file_read', { path: '../../../etc/passwd' });
-        eq(r.ok, false, 'must refuse');
-        assert((r.error ?? '').includes('escapes the workspace'), `expected escape refusal, got: ${r.error ?? r.content}`);
+    await check('relative paths resolve against the session workspace', async () => {
+        const r = await executor.execute('file_list', { path: '.' });
+        eq(r.ok, true, 'listing the workspace root must work');
     });
-    await check('workspace jail: absolute path outside root is refused', async () => {
-        const outside = process.platform === 'win32' ? 'C:\\Windows\\win.ini' : '/etc/passwd';
-        const r = await executor.execute('file_read', { path: outside });
-        eq(r.ok, false, 'must refuse');
+    await check('absolute paths are allowed (no jail)', async () => {
+        // There is deliberately no workspace jail: shell_run can reach anywhere the
+        // user can, so jailing the file tools only broke legitimate requests.
+        const target = process.platform === 'win32'
+            ? `${process.env['SystemRoot'] ?? 'C:\\Windows'}\\win.ini`
+            : '/etc/hostname';
+        const r = await executor.execute('file_read', { path: target });
+        // Either it reads the file, or it reports a real I/O error — but it must not
+        // be refused for being "outside the workspace".
+        assert(!(r.error ?? '').includes('escapes the workspace'), `must not apply a workspace jail, got: ${r.error ?? ''}`);
     });
     await check('unknown tool is refused by name', async () => {
         const r = await executor.execute('rm_rf_everything', {});
         eq(r.ok, false, 'must refuse');
         eq(r.error, 'unknown_tool', 'error kind');
     });
-    await check('shell is off unless enabled', async () => {
+    await check('shell is ON by default (opt out with QUICK_ACP_ALLOW_SHELL=0)', async () => {
         const p = defaultPolicy(process.cwd());
+        // The environment running this test may set the opt-out; honour it.
+        const expected = process.env.QUICK_ACP_ALLOW_SHELL !== '0';
+        eq(p.allowShell, expected, 'policy must default to enabled');
         const ex = new ToolExecutor(p);
         const r = await ex.execute('shell_run', { command: 'echo hi' });
-        if (p.allowShell) {
-            // Env opted in; nothing to assert about refusal.
-            return;
+        if (!expected) {
+            eq(r.ok, false, 'shell must be refused when explicitly disabled');
+            eq(r.error, 'shell_disabled', 'error kind');
         }
-        eq(r.ok, false, 'shell must be refused by default');
-        eq(r.error, 'shell_disabled', 'error kind');
+        else {
+            eq(r.ok, true, 'shell must execute when enabled');
+        }
     });
     await check('shell deny-list blocks destructive commands (when enabled)', async () => {
         const p = { ...defaultPolicy(process.cwd()), allowShell: true };

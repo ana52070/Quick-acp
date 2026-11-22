@@ -144,17 +144,17 @@ Quick 自己的客户端就是个**标准 OAuth 授权码 + PKCE 公共客户端
 
 ### 环境变量
 
+**全部可选。** 正常使用一个都不用设 —— 工作目录来自 ACP 客户端（你在客户端里选的那个文件夹）。
+
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `QUICK_ACP_WORKSPACE` | 当前目录 | 所有工具被禁锢在这个目录里 |
-| `QUICK_ACP_ALLOW_SHELL` | `0` | 开 shell 执行。默认关 |
-| `QUICK_ACP_TOOL_MODE` | 忽略 | 原生 MCP 在 `mcp-native` 分支，这里始终用 prompt 注入 |
+| `QUICK_ACP_ALLOW_SHELL` | 开 | 设 `0` 关闭命令执行 |
+| `QUICK_ACP_WORKSPACE` | 客户端传来的 cwd | **一般不用设**。仅在客户端不传 `cwd` 时作为兜底 |
+| `QUICK_ACP_MAX_TOOL_ROUNDS` | `12` | 单轮最多几次工具调用 |
+| `QUICK_ACP_DEBUG` | `0` | 详细日志到 stderr |
 | `QUICK_ACP_FRAMING` | `json-base64` | 帧格式。**默认就是对的**，别乱改：`cbor` 会让服务端静默丢消息 |
 | `QUICK_ACP_START_URL` | unset | 登录用的 portal 地址，等价于 `--start-url` |
 | `QUICK_ACP_TENANT_URL` | 自动发现 | 网关 host。登录后自动从 `profiles.json` / outpost 找回 |
-| `QUICK_ACP_NO_AUTOSTART` | unset | 设为 `1` 则不自动启动 outpost |
-| `QUICK_ACP_AGENT_BIN` | 自动查找 | outpost 可执行文件路径 |
-| `QUICK_ACP_DEBUG` | `0` | 详细日志到 stderr |
 
 ### 自检
 
@@ -167,17 +167,30 @@ node dist/no-outpost-e2e.js            # 不用 outpost 跑一轮真实对话
 
 ## 接入 codeg / T3Code
 
-ACP 客户端通过 stdio 启动 agent。注册成这样：
+### codeg（自定义智能体）
+
+「添加自定义智能体」里，分发信息填 **npx**：
+
+```json
+{
+  "npx": {
+    "package": "quick-acp@latest",
+    "args": []
+  }
+}
+```
+
+**环境变量不用填。** 工作目录来自你在 codeg 里选的项目文件夹。
+
+### 其他 ACP 客户端
+
+通过 stdio 启动，命令是 `npx quick-acp`（或本地 `node dist/main.js`）：
 
 ```json
 {
   "quick": {
-    "command": "node",
-    "args": ["D:/vscode_project/quick_rea/quick_acp/dist/main.js"],
-    "env": {
-      "QUICK_ACP_WORKSPACE": "D:/your/project",
-      "QUICK_ACP_ALLOW_SHELL": "1"
-    }
+    "command": "npx",
+    "args": ["-y", "quick-acp@latest"]
   }
 }
 ```
@@ -219,10 +232,14 @@ Quick 自己**已经有**文件读写/搜索/`apply_patch`（`desktop_windows.ya
 
 ### 安全边界
 
-- `shell_run` **默认关闭**，要 `QUICK_ACP_ALLOW_SHELL=1` 才开
-- 开了也会拦：`rm -rf /`、`mkfs`、`dd of=/dev/`、`sudo`、`curl | sh` 等
-- 所有路径被禁锢在 `QUICK_ACP_WORKSPACE` 内，`../` 或绝对路径越界一律拒绝
+- **命令执行默认开启**（`QUICK_ACP_ALLOW_SHELL=0` 可关）
+- 拦破坏性命令：`rm -rf /`、`mkfs`、`dd of=/dev/`、`sudo`、`curl | sh` 等
+- **没有文件夹禁锢** —— 理由见下
 - 输出有大小上限，写入有大小上限，命令有超时
+
+**为什么不做文件夹禁锢**：`shell_run` 本来就能 `cd` 到任何地方、读写任何文件。只给文件工具加目录限制，等于拦住了方便的路径却留着强力的路径，只会让「读一下隔壁文件夹那个文件」这种正常请求失败，换不来任何实际安全。所以要么整体禁 shell，要么就都放开。
+
+相对路径按客户端选的工作目录解析，绝对路径直接用。
 
 ### 工作方式
 
@@ -273,7 +290,7 @@ src/
     session.ts       thread 模型、增量流、附件
     gateway-contract.ts 实测出来的网关常量（有测试断言）
   tools/
-    registry.ts      工具定义、工作区禁锢、执行
+    registry.ts      工具定义与执行
     strategies.ts    prompt 注入式工具循环
   acp/agent.ts       ACP Agent 实现
   main.ts            ACP 入口

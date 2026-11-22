@@ -49,6 +49,93 @@ import { resolveToolMode, runWithInjectedTools, type ToolMode } from '../tools/s
 /** ACP protocol revision this agent implements. */
 const PROTOCOL_VERSION = 1;
 
+/**
+ * Removes the tool-call contract from the user-visible text stream.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The inject strategy asks the model to answer a tool need with a fenced block:
+ *
+ *   ```quick-tool-call
+ *   {"name": "shell_run", "arguments": {"command": "cd"}}
+ *   ```
+ *
+ * That block is an instruction to US, not something to show. But text arrives as
+ * deltas, so the first fragments of it were already streamed to the client before
+ * the parser had seen the whole thing — the user got a wall of JSON followed by
+ * the real answer, and the client rendered it as chat prose because it genuinely
+ * was chat prose by then.
+ *
+ * So the delta stream is filtered rather than the final string: hold back just
+ * enough characters to know whether a block is starting (the marker is short),
+ * and once inside one, drop everything until it closes.
+ */
+class ToolCallFilter {
+  /** Everything received but not yet emitted or discarded. */
+  private held = '';
+  /** True once a tool-call block has started and not yet closed. */
+  private inside = false;
+
+  constructor(private readonly emit: (delta: string) => Promise<void>) {}
+
+  async push(delta: string): Promise<void> {
+    this.held += delta;
+
+    for (;;) {
+      if (this.inside) {
+        const close = this.held.indexOf(TOOL_CALL_CLOSE);
+        if (close < 0) return; // still inside; wait for more
+        this.held = this.held.slice(close + TOOL_CALL_CLOSE.length);
+        this.inside = false;
+        continue;
+      }
+
+      const open = this.held.indexOf(TOOL_CALL_OPEN);
+      if (open < 0) {
+        // No marker yet. Emit everything except a tail that could still become
+        // the start of one, so a marker split across deltas is still caught.
+        const keep = Math.min(this.held.length, TOOL_CALL_OPEN.length - 1);
+        const cut = this.held.length - keep;
+        if (cut <= 0) return;
+        const safe = this.held.slice(0, cut);
+        this.held = this.held.slice(cut);
+        if (safe) await this.emit(safe);
+        return;
+      }
+
+      const before = this.held.slice(0, open);
+      if (before) await this.emit(before);
+      this.held = this.held.slice(open + TOOL_CALL_OPEN.length);
+      this.inside = true;
+    }
+  }
+
+  /** Emit whatever is left once the turn is over. */
+  async flush(): Promise<void> {
+    const rest = this.inside ? '' : this.held;
+    this.held = '';
+    this.inside = false;
+    if (rest) await this.emit(rest);
+  }
+}
+
+const TOOL_CALL_OPEN = '```quick-tool-call';
+const TOOL_CALL_CLOSE = '```';
+
+/**
+ * Per-session tool environment.
+ *
+ * The workspace is NOT a global: two conversations can be open on two different
+ * folders, and each must be jailed to its own. Everything the tools need is
+ * derived from the `cwd` the client sends with `session/new`.
+ */
+interface SessionTools {
+  workspaceRoot: string;
+  policy: ReturnType<typeof defaultPolicy>;
+  tools: ToolDef[];
+  executor: ToolExecutor;
+}
+
 interface SessionState {
   id: string;
   chat: QuickChatSession;
@@ -56,8 +143,20 @@ interface SessionState {
   agentMode: AgentMode;
   thinkingEffort: ThinkingEffort;
   cancelled: boolean;
-  /** Workspace this session's tools resolve against. */
+  /** Workspace this session's tools resolve against — from `session/new`. */
   cwd: string;
+  /** Tools bound to this session's cwd. */
+  sessionTools: SessionTools;
+}
+
+function buildSessionTools(workspaceRoot: string): SessionTools {
+  const policy = defaultPolicy(workspaceRoot);
+  return {
+    workspaceRoot,
+    policy,
+    tools: toolDefs(policy),
+    executor: new ToolExecutor(policy),
+  };
 }
 
 export class QuickAcpAgent implements Agent {
@@ -65,19 +164,15 @@ export class QuickAcpAgent implements Agent {
   private sessionSeq = 0;
   private quickSession: QuickSession | null = null;
   private readonly toolMode: ToolMode;
-  private readonly tools: ToolDef[];
-  private readonly executor: ToolExecutor;
-  private readonly workspaceRoot: string;
-  private readonly policy: ReturnType<typeof defaultPolicy>;
+  private readonly fallbackWorkspace: string;
   private conn: AgentSideConnection | null = null;
 
   constructor(opts: { workspaceRoot?: string } = {}) {
-    this.workspaceRoot = opts.workspaceRoot ?? process.cwd();
-    const policy = defaultPolicy(this.workspaceRoot);
+    // Only a FALLBACK. The real workspace comes from `session/new`'s `cwd`,
+    // which is the folder the user picked in the ACP client — that is the
+    // protocol's own mechanism and the only one that should matter.
+    this.fallbackWorkspace = opts.workspaceRoot ?? process.cwd();
     this.toolMode = resolveToolMode();
-    this.tools = toolDefs(policy);
-    this.executor = new ToolExecutor(policy);
-    this.policy = policy;
   }
 
   /** Called by main once the connection exists, so we can emit updates. */
@@ -107,8 +202,11 @@ export class QuickAcpAgent implements Agent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    // ACP's own workspace mechanism: the client sends the folder the user
+    // picked, and every tool call in this session is jailed to it. Falling back
+    // to the process cwd only when a client sends nothing.
     const cwd =
-      typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : this.workspaceRoot;
+      typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : this.fallbackWorkspace;
 
     // Each ACP session gets its OWN gateway socket and its own Quick thread, so
     // two conversations in the client map to two independent Quick threads.
@@ -158,6 +256,7 @@ export class QuickAcpAgent implements Agent {
       thinkingEffort: 'high',
       cancelled: false,
       cwd,
+      sessionTools: buildSessionTools(cwd),
     });
 
     return {
@@ -269,11 +368,15 @@ export class QuickAcpAgent implements Agent {
     // Tools are advertised in the prompt and driven by this loop. One extra
     // gateway turn per tool call is the price of needing nothing but the
     // gateway; the native MCP alternative lives on the `mcp-native` branch.
+    //
+    // The tool set and its jail come from THIS session's cwd, not from a global:
+    // two conversations on two folders must not see each other's files.
+    const st = session.sessionTools;
     const result = await runWithInjectedTools({
       userText,
-      tools: this.tools,
-      workspaceRoot: this.workspaceRoot,
-      executor: this.executor,
+      tools: st.tools,
+      workspaceRoot: st.workspaceRoot,
+      executor: st.executor,
       maxToolRounds: Number.parseInt(process.env.QUICK_ACP_MAX_TOOL_ROUNDS ?? '12', 10) || 12,
       turn: (text) => this.oneGatewayTurn(session, text, []),
       onAssistantText: () => {
@@ -294,6 +397,8 @@ export class QuickAcpAgent implements Agent {
     attachments: TurnAttachment[],
   ): Promise<{ text: string; cancelled: boolean }> {
     let full = '';
+    // Strips the tool-call contract out of what the user sees. See below.
+    const visible = new ToolCallFilter((delta) => this.emitText(session.id, delta));
     const stream = session.chat.sendTurn([{ role: 'user', text }], {
       agentMode: session.agentMode,
       thinkingEffort: session.thinkingEffort,
@@ -308,7 +413,7 @@ export class QuickAcpAgent implements Agent {
       switch (ev.type) {
         case 'text':
           full += ev.delta;
-          await this.emitText(session.id, ev.delta);
+          await visible.push(ev.delta);
           break;
         case 'thinking':
           // ACP has agent_thought_chunk for exactly this; forward it so the
@@ -329,6 +434,7 @@ export class QuickAcpAgent implements Agent {
       }
     }
 
+    await visible.flush();
     return { text: full, cancelled: session.cancelled };
   }
 
@@ -375,6 +481,23 @@ export class QuickAcpAgent implements Agent {
     }
   }
 
+  /**
+   * Announce a tool call to the client, then its outcome.
+   *
+   * TWO PROTOCOL MISTAKES THIS FIXES (both were visible in codeg as "the tool
+   * call JSON is printed as chat text instead of a tool card"):
+   *
+   * 1. The content block was `{ type: 'content', content: { text } }` — the
+   *    inner object must be a real text block, `{ type: 'text', text }`. Without
+   *    that discriminator a strict client drops the content as unrenderable.
+   *
+   * 2. The result was sent as a second `tool_call` with the same id. ACP models
+   *    this as `tool_call` (create) then `tool_call_update` (progress/result);
+   *    re-sending `tool_call` is undefined and clients ignore it.
+   *
+   * `kind` also matters: it is how a client decides which icon and affordance to
+   * show, and 'other' for everything made every call look identical.
+   */
   private async emitToolUpdate(
     session: SessionState,
     toolName: string,
@@ -385,22 +508,45 @@ export class QuickAcpAgent implements Agent {
   ): Promise<void> {
     if (!this.conn) return;
     const id = toolCallId ?? `tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const notification: SessionNotification = {
+
+    // Creation frame. No content yet: the call has not produced anything.
+    const created: SessionNotification = {
       sessionId: session.id,
       update: {
         sessionUpdate: 'tool_call',
         toolCallId: id,
-        title: toolName,
-        kind: 'other',
-        status: resultText === undefined ? 'in_progress' : ok ? 'completed' : 'failed',
-        rawInput: args,
-        ...(resultText === undefined
-          ? {}
-          : { content: [{ type: 'content', content: { type: 'text', text: resultText } }] }),
+        title: toolTitle(toolName, args),
+        kind: toolKind(toolName),
+        status: 'in_progress',
+        rawInput: asRawInput(args),
       },
     } as unknown as SessionNotification;
     try {
-      await this.conn.sessionUpdate(notification);
+      await this.conn.sessionUpdate(created);
+    } catch {
+      return; // client went away; nothing to update either
+    }
+
+    if (resultText === undefined) return;
+
+    // Result frame.
+    const updated: SessionNotification = {
+      sessionId: session.id,
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: id,
+        status: ok ? 'completed' : 'failed',
+        content: [
+          {
+            type: 'content',
+            content: { type: 'text', text: resultText },
+          },
+        ],
+        rawOutput: { output: resultText, ok },
+      },
+    } as unknown as SessionNotification;
+    try {
+      await this.conn.sessionUpdate(updated);
     } catch {
       /* client went away */
     }
@@ -421,8 +567,59 @@ export class QuickAcpAgent implements Agent {
   }
 }
 
-/** Flatten ACP prompt content blocks into text + attachments. */
-function extractContent(blocks: unknown): { text: string; attachments: TurnAttachment[] } {
+/**
+ * Map our tool names onto ACP's ToolKind.
+ *
+ * The client renders per kind (a read shows a file, an execute shows a
+ * terminal). Reporting 'other' for everything is why every call looked the same.
+ */
+function toolKind(toolName: string): string {
+  switch (toolName) {
+    case 'file_read':
+      return 'read';
+    case 'file_write':
+      return 'edit';
+    case 'file_list':
+    case 'file_search':
+      return 'search';
+    case 'shell_run':
+      return 'execute';
+    default:
+      return 'other';
+  }
+}
+
+/** A one-line human summary. The client shows this as the card's heading. */
+function toolTitle(toolName: string, args: unknown): string {
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
+  const str = (k: string): string => (typeof a[k] === 'string' ? (a[k] as string) : '');
+  const quoted = (v: string): string => (v.length > 72 ? `${v.slice(0, 69)}...` : v);
+
+  switch (toolName) {
+    case 'shell_run':
+      return `Run ${quoted(str('command') || 'command')}`;
+    case 'file_read':
+      return `Read ${quoted(str('path') || 'file')}`;
+    case 'file_write':
+      return `Write ${quoted(str('path') || 'file')}`;
+    case 'file_list':
+      return `List ${quoted(str('path') || '.')}`;
+    case 'file_search':
+      return `Search ${quoted(str('pattern') || '')}`;
+    default:
+      return toolName;
+  }
+}
+
+/** ACP wants rawInput as an object; a stray string would be dropped. */
+function asRawInput(args: unknown): Record<string, unknown> {
+  if (args && typeof args === 'object' && !Array.isArray(args)) {
+    return args as Record<string, unknown>;
+  }
+  return { value: args };
+}
+
+/** Flatten ACP prompt content blocks into text + attachments. */function extractContent(blocks: unknown): { text: string; attachments: TurnAttachment[] } {
   const parts: string[] = [];
   const attachments: TurnAttachment[] = [];
   if (!Array.isArray(blocks)) return { text: '', attachments };
