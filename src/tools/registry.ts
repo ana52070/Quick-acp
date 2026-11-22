@@ -24,7 +24,7 @@
  * no folder jail, because a shell that can `cd` anywhere makes one meaningless.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import { resolve, dirname, relative, isAbsolute, join, sep } from 'node:path';
 
@@ -408,43 +408,60 @@ export class ToolExecutor {
       let out = Buffer.alloc(0);
       let killedByTimeout = false;
       let killedBySize = false;
+      let settled = false;
+
+      const settle = (result: ToolResult): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise(result);
+      };
 
       const append = (chunk: Buffer): void => {
         out = Buffer.concat([out, chunk]);
         if (out.length > this.policy.maxOutputBytes && !killedBySize) {
           killedBySize = true;
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            /* already dead */
-          }
+          void killTree(child, child.pid);
         }
       };
 
       child.stdout?.on('data', append);
       child.stderr?.on('data', append);
 
+      // WHAT A TIMEOUT HAS TO DO ON WINDOWS
+      // -----------------------------------
+      // `shell: true` means the real command runs under cmd.exe, so it is a
+      // GRANDCHILD of this process. Killing the child leaves the grandchild
+      // alive, still holding the stdout pipe — and `close` fires only when every
+      // holder of that pipe is gone. Result: `kill('SIGKILL')` returns true, the
+      // process keeps running, and this promise never settles. That is a
+      // permanently hung tool call: it is exactly how "python snake.py" (a GUI
+      // app that never exits) froze a conversation with no error at all.
+      //
+      // So kill the whole tree, and keep a hard backstop: if `close` still has
+      // not fired shortly after the kill, settle anyway with what we captured.
       const timer = setTimeout(() => {
         killedByTimeout = true;
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          /* already dead */
-        }
+        void killTree(child, child.pid);
+        setTimeout(() => {
+          settle({
+            ok: false,
+            content: `${out.toString('utf8')}\n[timed out after ${timeoutMs}ms and did not exit]`,
+            error: 'timeout',
+          });
+        }, 2_000);
       }, timeoutMs);
 
       child.on('error', (err) => {
-        clearTimeout(timer);
-        resolvePromise({ ok: false, content: `failed to start: ${err.message}`, error: 'spawn_failed' });
+        settle({ ok: false, content: `failed to start: ${err.message}`, error: 'spawn_failed' });
       });
 
       child.on('close', (code, signal) => {
-        clearTimeout(timer);
         let text = out.toString('utf8');
         if (killedBySize) text += `\n[output truncated at ${this.policy.maxOutputBytes} bytes]`;
         if (killedByTimeout) text += `\n[timed out after ${timeoutMs}ms]`;
         const ok = code === 0 && !killedByTimeout;
-        resolvePromise({
+        settle({
           ok,
           content: text || '(no output)',
           ...(ok ? {} : { error: killedByTimeout ? 'timeout' : `exit_${code ?? signal}` }),
@@ -452,6 +469,50 @@ export class ToolExecutor {
       });
     });
   }
+}
+
+/**
+ * Kill a process and everything it spawned.
+ *
+ * On Windows `child.kill()` only signals the shell we launched; a grandchild
+ * survives it, keeps the stdout pipe open, and prevents the `close` event from
+ * ever firing. `taskkill /T` walks the tree. Elsewhere, killing the process
+ * group (`-pid`) takes the children with it.
+ */
+function killTree(child: ChildProcess, pid: number | undefined): Promise<void> {
+  if (pid === undefined) return Promise.resolve();
+
+  if (process.platform === 'win32') {
+    return new Promise<void>((done) => {
+      const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('close', () => done());
+      killer.on('error', () => {
+        // taskkill missing or refused: fall back to the single-process kill so
+        // the caller's backstop timer still settles the call.
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already dead */
+        }
+        done();
+      });
+    });
+  }
+
+  try {
+    // Negative pid == the process group, so children die too.
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already dead */
+    }
+  }
+  return Promise.resolve();
 }
 
 // ---------------------------------------------------------------------------
