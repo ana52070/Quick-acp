@@ -4,42 +4,26 @@
  *
  * Speaks ACP over stdin/stdout. Everything diagnostic goes to stderr, because
  * stdout is the protocol channel and a stray console.log corrupts the stream.
+ *
+ * NOTE ON STARTUP: this used to start Quick's outpost here, because refreshing
+ * the token "had to" go through it. That turned out to be wrong — the token
+ * refreshes fine against oidc.<region>.api.aws with the client secret as Basic
+ * auth, and the gateway host is just `tenant_url` without its scheme. So there
+ * is nothing to start: the first turn resolves a session from the stored login
+ * or ~/.quick-acp/login.json and dials directly. Less to go wrong, and it works
+ * on a machine that has never had the desktop app installed.
  */
 
 import { AgentSideConnection, ndJsonStream } from '@zed-industries/agent-client-protocol';
 import { QuickAcpAgent } from './acp/agent.js';
-import { startOutpost, outpostIsUp } from './quick/auth.js';
 
 async function main(): Promise<void> {
   const workspaceRoot = process.env.QUICK_ACP_WORKSPACE ?? process.cwd();
 
   if (process.env.QUICK_ACP_PRINT_INFO === '1') {
     console.error('[quick-acp] workspace root:', workspaceRoot);
-    console.error('[quick-acp] tool mode:', process.env.QUICK_ACP_TOOL_MODE ?? 'mcp (default)');
+    console.error('[quick-acp] tools: prompt-injected (one extra turn per tool call)');
     console.error('[quick-acp] shell enabled:', process.env.QUICK_ACP_ALLOW_SHELL === '1');
-    console.error('[quick-acp] framing:', process.env.QUICK_ACP_FRAMING ?? 'cbor (default)');
-  }
-
-  // Bring up the credential path before serving ACP.
-  //
-  // Quick's tokens can only be refreshed by its own outpost (the stored client
-  // is a Quick-Portal device client that the public OIDC endpoint rejects), so
-  // the bridge starts that outpost itself when one is not already running.
-  // Without this the user would have to copy an ephemeral in-memory token on
-  // every restart.
-  if (process.env.QUICK_ACP_NO_AUTOSTART !== '1') {
-    const already = await outpostIsUp();
-    if (!already) {
-      console.error('[quick-acp] no outpost running; starting one so the login can be refreshed');
-    }
-    const r = await startOutpost();
-    if (!r.started) {
-      // Not fatal: a client may only be calling initialize (as the smoke test
-      // does). Report it and let the first real turn surface the error.
-      console.error(`[quick-acp] outpost not available: ${r.reason}`);
-    } else if (r.reason) {
-      console.error(`[quick-acp] ${r.reason}`);
-    }
   }
 
   const agent = new QuickAcpAgent({ workspaceRoot });

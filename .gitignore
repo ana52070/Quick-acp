@@ -1,3 +1,14 @@
-﻿node_modules/
-dist/
+node_modules/
 *.log
+
+# dist/ IS committed on purpose.
+#
+# codeg launches agents from a distribution spec, and the JS channel for that is
+# `npx` — which is what makes this work on someone else's machine without them
+# editing paths. That means the package has to run after a plain `npx <repo>`
+# install, and npm installs do NOT run `prepare` for git dependencies over
+# https… except when they do. Rather than depend on that, the built output is
+# checked in: it is 430 KB of plain ESM, it is what actually runs, and its
+# presence removes an entire class of "works on my machine" failures.
+#
+# Rebuild before committing with:  npm run build && npm run verify
