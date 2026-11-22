@@ -136,7 +136,20 @@ export class QuickAcpAgent implements Agent {
 
     await chat.open();
 
-    const id = `quick-${++this.sessionSeq}`;
+    // The session id must be unique ACROSS PROCESS LIFETIMES, not just within
+    // this one.
+    //
+    // It used to be `quick-${++this.sessionSeq}`, which restarts at 1 on every
+    // agent start. codeg remembers which conversation a session is bound to, so
+    // the second conversation to ever use the agent was told:
+    //
+    //   conflict: agent session quick-1 is already bound to conversation 770;
+    //   refusing to move it onto conversation 771
+    //
+    // and could never send a message. The Quick thread id is a UUID that this
+    // session owns for its whole life, so reusing it gives an id that is unique
+    // for real (and correlates with the thread in any server-side logs).
+    const id = chat.ensureThread();
     this.sessions.set(id, {
       id,
       chat,

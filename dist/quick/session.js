@@ -80,6 +80,20 @@ export class QuickChatSession {
     get threadId() {
         return this.state?.threadId ?? null;
     }
+    /**
+     * Create this session's thread now, if it does not have one.
+     *
+     * The thread id is only a UUID until the first turn — the server accepts a
+     * fresh one and creates the conversation. But callers need a stable identity
+     * for the session BEFORE the first turn: an ACP client binds the session id to
+     * a conversation the moment the session is created, and an id that only
+     * appears after the first message is no id at all.
+     */
+    ensureThread() {
+        if (!this.state)
+            this.state = { threadId: randomUUID(), sentTurns: [] };
+        return this.state.threadId;
+    }
     /** Forget the thread, so the next turn starts a fresh conversation. */
     resetThread() {
         this.state = null;
