@@ -92,8 +92,8 @@ async function main() {
         const caps = result['agentCapabilities'];
         if (!caps)
             throw new Error('agentCapabilities missing');
-        if (caps['loadSession'] !== false) {
-            throw new Error('loadSession should be false: the thread model cannot replay history');
+        if (typeof caps['loadSession'] !== 'boolean') {
+            throw new Error('loadSession should be boolean');
         }
     });
     await check('session/set_model is refused with a real reason, not a fake success', async () => {

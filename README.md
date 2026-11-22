@@ -1,423 +1,372 @@
-# quick-acp
+# Quick-acp
 
-一个 **ACP agent**，把 AWS Quick（Quickwork）的 Claude 额度接进任何支持 ACP 的客户端（codeg、T3Code、Zed…），并补上本机 shell 执行能力。
+[Codeg 配置教程](docs/Codeg配置教程.md) · [T3 Code 配置教程](docs/T3Code配置教程.md) · [能力对标](docs/能力对标.md) · [0.1.8更新说明](docs/0.1.8更新说明.md) · [0.1.8重装复验](docs/0.1.8重装复验.md) · [0.1.7更新说明](docs/0.1.7更新说明.md) · [0.1.6更新说明](docs/0.1.6更新说明.md) · [打包与CI发布](docs/打包与CI发布指南.md) · [贡献指南](CONTRIBUTING.md) · [安全策略](SECURITY.md)
+
+[![CI](https://github.com/ana52070/Quick-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/ana52070/Quick-acp/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/badge/npm-0.1.8-blue.svg)](https://www.npmjs.com/package/quick-acp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/Node-%3E%3D22-blue.svg)](package.json)
+
+Quick-acp 是一个将 **AWS Quick (Quickwork)** 的 Claude 配额与推理能力，桥接到任何标准 **ACP (Agent Client Protocol)** 编辑器（如 **[codeg](https://github.com/xintaofei/codeg)**、**[T3 Code](https://t3.codes)**、**[Zed](https://zed.dev)** 等）的本地执行代理。同时为上游 Quick 补充了客户端所需的本地 Shell 执行、文件读写及多模态图片交互能力。
 
 ```
-codeg / T3Code  ──ACP (JSON-RPC over stdio)──▶  quick-acp  ──Quick bidi (WSS)──▶  Quick 网关
-                                                     │
-                                                     └── 本机执行 shell / 文件工具
+codeg / T3 Code / Zed ──ACP (JSON-RPC over stdio)──▶ quick-acp ──Quick bidi (WSS)──▶ Quick 网关
+                                                        │
+                                                        ├── 本机执行 Shell 与文件操作 (高危命令黑名单过滤，无沙箱)
+                                                        ├── 会话级 MCP 挂载 (stdio / Streamable HTTP / SSE)
+                                                        └── 本地会话持久化与状态恢复 (~/.quick-acp/sessions)
 ```
 
-**不需要安装 Quick 桌面客户端。** 一次浏览器登录即可。
+**无需安装 Quick 官方桌面客户端**，通过系统已有凭据或独立的浏览器 OIDC 登录即可直连网关。
+
+> ⚠️ **quick-acp 会以你的用户权限在本机执行命令、读写文件，它不是沙箱。** 使用前请务必阅读 [安全策略](SECURITY.md) 中的安全边界说明。若需收紧，设置 `QUICK_ACP_ALLOW_SHELL=0` 关闭命令执行，或 `QUICK_ACP_PERMISSION_MODE=ask` 逐次确认敏感操作。
 
 ---
 
-## 它能给你什么
+## 核心特性与验证状态
 
-1. **在 codeg 里用 Quick 的 Claude 额度**——Quick 变成 codeg 里的一个 agent，Smart 档位可命中 Opus
-2. **补上本机 shell 执行**——Quick 自己不给客户端这个能力
-3. **思考流和图片都保留**——`thinking_delta` → `agent_thought_chunk`，图片附件透传
-4. **支持多开**——codeg 里开两个对话 = 两条独立 WSS + 两个独立 Quick thread，互不干扰
-
-> **免责声明**：本项目通过逆向分析实现与 Quick 服务的互通，仅用于个人学习与自用。使用它可能违反 Quick 的服务条款，风险自负。请勿用于商业分发。
-
----
-
-## 验证状态（哪些测过，哪些没有）
-
-| 项目 | 状态 | 依据 |
+| 能力 | 当前实现 | 已有验证证据 |
 |---|---|---|
-| 编解码 / 工具 / ACP 接线 | ✅ 已测 | `npm run verify`（39 项） |
-| 从 Windows 凭据库读登录态 | ✅ **实测** | 读出 refresh_token/client_id/client_secret |
-| **WSS 连接握手** | ✅ **实测** | 收到 `session_established` |
-| **网关鉴权方式** | ✅ **实测** | query 可行、header 401 |
-| **长连接保活** | ✅ **实测** | 发 ping 后 60s 无 `IDLE_TIMEOUT` |
-| **`user_message` → 真实回复** | ✅ **实测** | `resolved_model_id: us.anthropic.claude-opus-5-5` |
-| **端到端 ACP → Quick → 模型 → ACP** | ✅ **实测** | `npm run e2e` |
-| **自己刷新 token** | ✅ **实测** | `oidc.us-east-1.api.aws` + Basic auth → 200 |
-| **完全不用 outpost** | ✅ **实测** | `npm run e2e:no-outpost` |
-| **无官方客户端的真实登录** | ✅ **实测** | `npm run e2e:fresh`：浏览器登录 → 直连 → 模型回复 |
-| **`inject` 工具循环** | ✅ **实测** | `npm run test:tools`：模型发工具调用 → 本地执行 → 最终答案 |
-| **多轮连续对话** | ✅ **实测** | 连续 3 轮全部正确（曾是真 bug） |
-| **思考转发** | ✅ **实测** | `thinking_delta` → `agent_thought_chunk`（曾完全失效） |
-| **图片附件** | ✅ **实测** | 发一张 crimson PNG，模型答「红色」 |
-| **并发多会话** | ✅ **实测** | 两个 session 同时提问，各自答对，无串话 |
-| 原生 MCP 工具通道 | ⚠️ **需桌面端** | 见「MCP 分支」 |
+| ACP、本机读写与Shell | 标准stdio协议、本地文件工具、命令执行与工具卡片 | 0.1.8正式包复验：超额明确未完成（max_turn_requests）；额度内10次本机调用、7项测试、三文件自主回读通过 |
+| 嵌套代码块与多调用 | 平衡JSON解析、流过滤、顺序工具调度 | 离线回归；Codeg写入含代码块README并回读通过 |
+| 图片与嵌入上下文 | 首轮图片转发、嵌入文本提取 | 代码与回归覆盖；本轮Codeg未做图片专项测试 |
+| 会话列表、恢复与分叉 | 本地持久化、原thread续接、会话级全量历史分支 | 离线ACP集成通过；Codeg交互入口未做专项复验 |
+| MCP | 官方SDK stdio/Streamable HTTP/SSE客户端 | 本地协议fixture覆盖工具调用、取消和关闭；外部服务及Codeg界面未专项复验 |
+| 计划、命令与技能 | plan_update、/help /mode /plan /clear、SKILL.md与skill_read | 离线状态机与ACP集成通过 |
+| 权限与提问 | auto/ask、敏感操作审批、单选按钮 | 离线拒绝无副作用与ACP双向请求通过；不支持多选或自由文本表单 |
+| 未保存缓冲区与用量 | 客户端fs委托；_meta与自定义用量扩展 | 离线集成通过；用量UI取决于客户端支持 |
+| 重试、取消和并发保护 | 分类退避、副作用/正文守卫、同会话互斥 | 离线回归覆盖；未做真实服务故障注入 |
+| 模型选择 | Fast/Balanced/Smart档位；不接受任意modelId | 当前网关接入未提供已验证的任意选模接口 |
 
-**关键实测：** 全链路已打通，**并且不需要官方桌面客户端**。
+Windows已实测。CI工作流配置Windows与Ubuntu，尚无本轮远端CI运行结果；macOS未配置该矩阵，也未本地实测。文件工具允许绝对路径，Shell按本机进程权限执行，命令黑名单不构成系统沙箱。
 
-```
-*** FRESH MACHINE END-TO-END SUCCESS ***
-*** browser sign-in -> OIDC refresh -> gateway -> model -> text ***
-*** no Quick install, no outpost, no Electron, no keychain entry ***
-```
-
-
+**版本演进与稳定性**：0.1.6加入默认本机路由保护；0.1.7修复心跳误杀与套接字异常误报认证；0.1.8修复工具额度耗尽误报完成，返回max_turn_requests并显示未完成进度。0.1.8正式发布包的干净重装复验已通过：超额任务（Codeg会话828）正确返回max_turn_requests并标为未完成，额度内任务（会话827）10次调用完成项目、7项测试与三文件自主回读。
 
 ---
 
-## 安装
+## 安装与快速开始
 
-需要 Node ≥ 22。
+### 方式一：npx 免安装直接使用（首选推荐）
+
+无需克隆代码或本地编译，确保环境 **Node.js ≥ 22** 即可开箱即用：
 
 ```bash
+# 运行环境自检（只读，先跑这个）
+npx -y quick-acp doctor
+
+# 登录 AWS Quick（已登录官方桌面端时可跳过）
+npx -y quick-acp-login --start-url https://<你的SSO入口>.awsapps.com/start
+
+# 启动代理（通常由 ACP 客户端拉起，手工运行会阻塞等待 stdin）
+npx -y quick-acp@0.1.8
+```
+
+> **注意**：`quick-acp` 没有 `--version` / `--help` 参数，带上这些参数它会忽略并直接启动 ACP 服务、阻塞等待 stdin，看起来像卡住。要确认版本请用 `npm ls -g quick-acp` 或 `npm view quick-acp version`。
+
+### 方式二：本地源码编译运行（次选，二次开发）
+
+```bash
+git clone https://github.com/ana52070/Quick-acp.git
+cd Quick-acp
 npm install
 npm run build
-npm run verify     # 38 项检查
+npm test              # 全套离线测试（build + probe + smoke + 19项回归 + 9项路由 + 11步集成 + 5项根因 + 10项工具预算）
 ```
 
 ---
 
-## 登录：两条路，都不用手抄 token
+## 登录与鉴权
 
-### 路线 A：已经装过 Quick 桌面端并登录过
+Quick-acp 支持两种鉴权方式：
 
-**什么都不用做。** 直接跑，quick-acp 自己读：
+1. **自动读取系统凭据（推荐日常使用）**：
+   若本机已运行并登录过 Quick 官方桌面端，Quick-acp 会自动从 Windows 凭据管理器或 macOS Keychain 中读取刷新令牌并自动重组。
+2. **免桌面端浏览器单点登录**：
+   ```bash
+   npx -y quick-acp-login --start-url https://<your-sso-portal>.awsapps.com/start
+   ```
+   启动本地单点登录并在浏览器中完成认证，刷新凭据保存在本地 `~/.quick-acp/login.json`（权限 0600），后续直连 AWS OIDC 刷新。
 
-```
-LegacyGeneric:target=quickwork-social-<profileId>         ← 元信息（块数、校验）
-LegacyGeneric:target=quickwork-social-<profileId>_chunk_0 ← 含 refresh_token 的 JSON
-LegacyGeneric:target=quickwork-social-<profileId>_chunk_1
-```
-
-读完自己刷新 token，然后直连网关。**不需要 outpost，不需要 instance token，不需要 Electron。**
-
-### 路线 B：从没装过官方客户端
-
+运行自检诊断命令检查凭据有效性：
 ```bash
-node dist/login-cli.js --start-url https://ssoins-xxxxx.awsapps.com/start
-```
-
-`--start-url` 是你的 **AWS access portal 地址**。从哪来：
-
-1. 打开 `https://quicksight.aws.amazon.com`（或任意 AWS 控制台）登录
-2. 浏览器会落到你的 access portal，地址栏形如 `https://ssoins-1a2b3c4d5e6f.awsapps.com/start`
-3. 把整个地址复制过来
-
-然后浏览器会打开 AWS 登录页，登录完写 `~/.quick-acp/login.json`（0600 权限）。之后直接跑，不用再登录。
-
-### 这条登录链是怎么打通的
-
-Quick 自己的客户端就是个**标准 OAuth 授权码 + PKCE 公共客户端**。证据是它存在凭据库里的 `client_secret` —— 那东西其实是个明文 JWT，解开就是：
-
-```json
-{"clientType":"PUBLIC",
- "enabledGrants":{
-   "AUTH_CODE":{"redirectUris":["http://127.0.0.1:18080"]},
-   "REFRESH_TOKEN":{...}},
- "scopes":[{"fullScope":"quicksight:read_write"}]}
-```
-
-所以就照标准流程走：
-
-| 步骤 | 端点 | 实测结果 |
-|---|---|---|
-| 动态注册客户端 | `POST oidc.us-east-1.api.aws/client/register` | ✅ 200，返回 `clientId` + `clientSecret` |
-| 授权（PKCE S256） | `GET /authorize` | ✅ 302 → AWS 登录页，带 `identitystore_id` |
-| 浏览器回调 | `http://127.0.0.1:18080?code=...` | ✅ 拿到 code |
-| 换 token | `POST /token`（**表单字段**） | ✅ 200，拿到 access + refresh |
-| 刷新 token | `POST /token`（**Basic auth**） | ✅ 200 |
-
-**两处必须记牢，弄反就 400：**
-
-| 操作 | `client_secret` 放哪 |
-|---|---|
-| `authorization_code` 换 token | **表单字段**（和 `client_id` 一起放 body）|
-| `refresh_token` 刷新 | **HTTP Basic**（`client_id:client_secret` 放 header）|
-
-放反了两边都是 400，而且报错只说 "Invalid request"，什么都不告诉你。这个坑我在开发时踩了两次。
-
-### 更正：之前报告里说"自己刷新 token 不行"是错的
-
-那份报告的结论基于这两次失败：
-
-| 端点 | 结果 |
-|---|---|
-| `identitycenter.amazonaws.com/<instance>/token` | 403 |
-| `oidc.<region>.amazonaws.com/token`（表单） | 400 |
-| `oidc.<region>.amazonaws.com/token`（JSON） | 401 invalid_client |
-| `<instance>.<region>.portal.amazonaws.com/token` | 404 |
-
-**原因是查询的域名全是旧的。** 正确的是 `oidc.<region>.api.aws`。而且 `client_secret` 要放 Basic auth 而不是 body。
-
-换成正确域名 + Basic auth，一次就 200。所以 outpost 不是必需的——它现在只是 B 计划。
-
-### 环境变量
-
-**全部可选。** 正常使用一个都不用设 —— 工作目录来自 ACP 客户端（你在客户端里选的那个文件夹）。
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `QUICK_ACP_ALLOW_SHELL` | 开 | 设 `0` 关闭命令执行 |
-| `QUICK_ACP_WORKSPACE` | 客户端传来的 cwd | **一般不用设**。仅在客户端不传 `cwd` 时作为兜底 |
-| `QUICK_ACP_MAX_TOOL_ROUNDS` | `12` | 单轮最多几次工具调用 |
-| `QUICK_ACP_DEBUG` | `0` | 详细日志到 stderr |
-| `QUICK_ACP_FRAMING` | `json-base64` | 帧格式。**默认就是对的**，别乱改：`cbor` 会让服务端静默丢消息 |
-| `QUICK_ACP_START_URL` | unset | 登录用的 portal 地址，等价于 `--start-url` |
-| `QUICK_ACP_TENANT_URL` | 自动发现 | 网关 host。登录后自动从 `profiles.json` / outpost 找回 |
-
-### 自检
-
-```bash
-node dist/doctor.js                    # 看凭据状态
-node dist/no-outpost-e2e.js            # 不用 outpost 跑一轮真实对话
+npx -y quick-acp doctor
 ```
 
 ---
 
-## 接入 codeg / T3Code
+## 编辑器配置指南
 
-### codeg（自定义智能体）
+支持任何标准 ACP 客户端。下面给出 Codeg、T3 Code、Zed 三种已验证或已知可用形态的配置，并为每种客户端附一段**可直接粘给 AI 助手执行的配置提示词**。
 
-「添加自定义智能体」里，分发信息填 **npx**：
+### 环境变量速查
+
+配置里出现的环境变量都在这里，按需增减。带「默认」的项不写也是这个值。
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `QUICK_ACP_ALLOW_SHELL` | `1` | 设为 `0` 关闭本机命令执行，只保留文件读写。**安全相关**，见 [SECURITY.md](SECURITY.md) |
+| `QUICK_ACP_PERMISSION_MODE` | `auto` | 设为 `ask` 时，敏感操作（删除、覆盖、发布等）逐次请求确认 |
+| `QUICK_ACP_MAX_TOOL_ROUNDS` | `12` | 单回合工具调用上限，失败调用同样计数。超出时返回 `max_turn_requests` |
+| `QUICK_ACP_WORKSPACE` | 进程工作目录 | 工作区根目录。ACP 客户端通常通过 `session/new.cwd` 传入，一般不用设 |
+| `QUICK_ACP_SESSIONS_DIR` | `~/.quick-acp/sessions` | 本地会话持久化目录 |
+| `QUICK_ACP_TURN_TIMEOUT_MS` | `180000` | 单轮上游等待上限（毫秒） |
+| `QUICK_ACP_HEADLESS` | 未设置 | 设为 `1` 时禁用 `ask_user_question`，适合无人值守场景 |
+| `QUICK_ACP_DEBUG` | 未设置 | 设为 `1` 输出调试日志到 `stderr` |
+| `QUICK_ACP_QUICKWORK_HOME` | `~/.quickwork` | Quick 桌面端数据目录，用于自动读取凭据 |
+
+### Codeg 配置
+
+**推荐用 npx 分发**，版本固定，不用管路径。在 **Settings → Agents → Add custom agent** 中填：
 
 ```json
 {
   "npx": {
-    "package": "quick-acp@latest",
+    "package": "quick-acp@0.1.8",
     "args": []
   }
 }
 ```
 
-**环境变量不用填。** 工作目录来自你在 codeg 里选的项目文件夹。
-
-### 其他 ACP 客户端
-
-通过 stdio 启动，命令是 `npx quick-acp`（或本地 `node dist/main.js`）：
+若你的 Codeg 版本要求 command/args 形式：
 
 ```json
 {
-  "quick": {
-    "command": "npx",
-    "args": ["-y", "quick-acp@latest"]
+  "command": "npx",
+  "args": ["-y", "quick-acp@0.1.8"],
+  "env": {
+    "QUICK_ACP_ALLOW_SHELL": "1",
+    "QUICK_ACP_PERMISSION_MODE": "auto",
+    "QUICK_ACP_MAX_TOOL_ROUNDS": "12"
   }
 }
 ```
 
-**不需要 `QUICK_ACP_INSTANCE_TOKEN`。** 登录态来自凭据库或 `~/.quick-acp/login.json`，走直连路径。
-
-**诊断信息只走 stderr。** stdout 是 JSON-RPC 通道，一行 `console.log` 就会把协议搞坏。
-
----
-
-## 模式映射（这就是"选模型"）
-
-Quick 不让人直接选模型，只有档位。ACP 的 mode 直接映射过去：
-
-| codeg 里选 | 实际发给 Quick | 效果 |
-|---|---|---|
-| **Fast** | `agent_mode: fast` | 最快，不思考 |
-| **Balanced** | `agent_mode: balanced` | 平衡 |
-| **Smart** | `agent_mode: smart` | 最高质量 + 深度思考，**最容易命中 Opus** |
-
-想用 Opus 就选 **Smart**。具体用哪个模型由 Quick 服务端决定，会在 `token_usage.resolved_model_id` 里回报。
-
-`session/set_model` 会被明确拒绝——因为 Quick 不支持，假装成功等于骗你。
-
----
-
-## 工具
-
-### 为什么不重复造文件工具
-
-Quick 自己**已经有**文件读写/搜索/`apply_patch`（`desktop_windows.yaml` 是 `default_available: true`）。**真正缺的是本机 shell。**
-
-所以这里提供的工具：
-
-| 工具 | 理由 |
-|---|---|
-| `shell_run` | **真空缺**。Quick 的 `device_shell` 卡在 `code_mode_enabled` + `deviceShell` + `sandbox.available` 三重门上 |
-| `file_read` / `file_write` / `file_list` / `file_search` | 保留：本机执行比绕 Quick 的 agent 循环省一整轮 |
-
-### 安全边界
-
-- **命令执行默认开启**（`QUICK_ACP_ALLOW_SHELL=0` 可关）
-- 拦破坏性命令：`rm -rf /`、`mkfs`、`dd of=/dev/`、`sudo`、`curl | sh` 等
-- **没有文件夹禁锢** —— 理由见下
-- 输出有大小上限，写入有大小上限，命令有超时
-
-**为什么不做文件夹禁锢**：`shell_run` 本来就能 `cd` 到任何地方、读写任何文件。只给文件工具加目录限制，等于拦住了方便的路径却留着强力的路径，只会让「读一下隔壁文件夹那个文件」这种正常请求失败，换不来任何实际安全。所以要么整体禁 shell，要么就都放开。
-
-相对路径按客户端选的工作目录解析，绝对路径直接用。
-
-### 工作方式
-
-把工具定义写进 prompt，让模型输出带标记的代码块，本地执行后把结果当下一轮用户消息喂回去：
-
-```quick-tool-call
-{"name": "shell_run", "arguments": {"command": "dir"}}
-```
-
-- ✅ **不需要 outpost、不需要 instance token、不需要桌面端**
-- ✅ 全新机器登录完就能用
-- ❌ 每次工具调用多一整轮对话
-- ❌ 靠模型遵守格式，不是协议保证
-
-实测（`npm run test:tools`）：模型会规范输出这个块，工具本地执行，然后给出最终答案。
-
-### 关于原生 MCP
-
-理论上可以让模型**原生调用**工具（零额外轮次、不依赖模型写 JSON）。这条路实现在 **`mcp-native` 分支**，没有合并进来，原因很实在：启用本地 MCP server 要过两道门，**都在 Quick 桌面端**。
-
-参考：想自己研究的话，`mcp-native` 分支里有完整的逆向记录和待解决的三个环节。
-
----
-
-## 已知局限
-
-这些是架构决定的，不是 bug：
-
-1. **不能重放历史。** Quick 服务端按 thread 存上下文，客户端只发增量。所以 `loadSession: false`，新会话就是新 thread。
-2. **不能指定模型。** 只能选档位。`session/set_model` 明确拒绝。
-3. **额度按 `agent_hours` 计。** 不是按 token。长时间输出会快速消耗月度额度。
-4. **同一会话内串行。** Quick thread 是一问一答的流。但**多个会话可以并行**——每个 ACP session 一条独立 WSS。
-5. **音频不支持。** 图片和文本可以。`promptCapabilities.audio: false`。
-
----
-
-## 目录结构
-
-```
-src/
-  quick/
-    codec.ts         CBOR + event-stream + Quick 帧（两种模式）
-    auth.ts          会话获取（直连 → outpost → 明确报错）
-    credstore.ts     Windows 凭据库读取（分块重组）
-    login.ts         真实登录：动态注册 + PKCE + 换 token + 刷新
-    session-direct.ts 不用 outpost，从登录态直接拼会话
-    transport.ts     WSS 拨号、握手、看门狗、token 刷新
-    session.ts       thread 模型、增量流、附件
-    gateway-contract.ts 实测出来的网关常量（有测试断言）
-  tools/
-    registry.ts      工具定义与执行
-    strategies.ts    prompt 注入式工具循环
-  acp/agent.ts       ACP Agent 实现
-  main.ts            ACP 入口
-  login-cli.ts       登录命令行
-  probe.ts           编解码 / 工具 / 工具契约检查
-  acp-smoke.ts       5 项 ACP 接线检查
-  e2e.ts             端到端（ACP → Quick → 模型 → ACP）
-  no-outpost-e2e.ts  端到端（不走 outpost）
-  fresh-machine-e2e.ts 端到端（模拟全新机器，纯浏览器登录）
-  inject-turn-test.ts  多轮对话 + 工具循环回归（这两个都曾是真 bug）
-  concurrent-test.ts   两个会话并发，检查不串话
-```
-
----
-
-## 已知未完成
-
-**原生 MCP 工具通道需要 Quick 桌面端。** 不开桌面端也能用（走 `inject`），只是每次工具调用多一轮。
-
-这不是"技术不可能"，而是**当前桥接没有实现独立的权限初始化与确认链**。要让 MCP 完全不依赖桌面端，需要补三样东西：
-
-1. 自己触发组织策略解析（`admin controls`），让 `permissions_pending` 解除
-2. 自己实现命令确认的用户交互（替代 Electron 的原生对话框）
-3. 走通工具发布到云端的环节
-
-前两步是工程问题，第三步还没找到接口。所以现状是：**MCP 保留为可选增强，`inject` 作为默认。**
-
-顺带记一个容易误判的点：`permissions_pending` 和 `Invalid or missing confirmation nonce` 是**两道独立的门**，通常先撞前者。桌面端日志证明前者确实会自己解除：
-
-```
-18:37:29  [OutpostServer] admin controls unresolved after 30.0s; MCP mutations remain pending
-18:37:47  [OutpostBoot]   local_mcp_connect gate=resolved gate_wait_ms=0
-
-
----
-
-## 实测出的协议真相（和代码里写的不一样）
-
-逆向读到的和网关实际接受的**有三处不一致**，不实测根本发现不了：
-
-### 1. 鉴权必须在 query，不能在 header
-
-| 方式 | 结果 |
-|---|---|
-| `Authorization: Bearer <jwt>` | **401** |
-| `?token=<jwt>` | **OPEN** |
-
-渲染层 `IZe()` 确实往 header 里塞 Bearer，但那是走主进程 IPC 代理的路径。用裸 `ws` 客户端发同样的 header 会被拒。
-
-**这是最容易踩的坑：拿着有效 token 却一直 401。**
-
-### 2. `surfaceType` 是必填 query 参数
-
-没有它，即使 token 正确也是 401。加上 `?surfaceType=QUICK_WORK_DESKTOP_WINDOWS` 才通过。
-
-### 3. 路径是 `/streaming/...` 不是 `/ws/service/...`
-
-| 路径 | 结果 |
-|---|---|
-| `/streaming/quickwork-chat-bidirectional-stream` | 401（路径对，鉴权错）→ 修好鉴权后 OPEN |
-| `/ws/service/SpaceNeedleConversationService/operation/...` | **404** |
-
-### 4. 服务端 95 秒无帧就断
-
-```
-{"type":"error","code":"IDLE_TIMEOUT","message":"Client sent no frames for >95 seconds"}
-```
-
-必须定时发 `ping`。代码里用 45 秒。
-
-### 5. `connected` 帧不是对话前置条件
-
-它属于 WebRTC 语音路径（`LiveConversationWebRtcClient*`），聊天不等它。没有它不代表有问题。
-
-### 6. **不能用 `turn_usage` 判断一轮结束**（这条坑最隐蔽）
-
-`turn_usage` 比真正的结束早到几百毫秒。如果拿它当结束信号、立刻发下一条消息，服务端还在收尾，会把新消息当成上一轮的回显吞掉：
+本地源码构建的备选方案：
 
 ```json
-{"type":"message_complete","payload":{"text":"","initiator":"user"}}
+{
+  "command": "node",
+  "args": ["D:/projects/quick-acp/dist/main.js"],
+  "env": { "QUICK_ACP_ALLOW_SHELL": "1" }
+}
 ```
 
-实测对照（同一条 socket）：
+**交给 AI 助手执行的提示词：**
 
-| 场景 | 结果 |
-|---|---|
-| 连续发两轮 | 第 2 轮空 |
-| 连续发三轮 | 第 2 轮空，**第 3 轮拿到第 2 轮的答案** |
-| 两轮之间等 2.5 秒 | 两轮都正常 |
+````text
+请帮我在 Codeg 里配置 quick-acp 这个 ACP 智能体。
 
-第 3 轮拿到 T2 这说明消息**只是排队，没有丢**。正确做法是等 `message_complete` 才关流，`turn_usage` 只用来报告用量。
+背景：quick-acp 已发布到 npm，包名 quick-acp，当前版本 0.1.8，是一个把 AWS Quick
+的 Claude 额度桥接成标准 ACP agent 的本地代理。
 
-这个 bug 影响每一次多轮对话，不只是工具调用，但单轮 e2e 测试完全测不出来。
+请按以下步骤操作，每一步做完告诉我结果，遇到问题停下来说明，不要猜测：
+1. 先确认 Node.js 版本：运行 node -v，必须 ≥ 22。
+2. 确认 quick-acp 能跑：运行
+   npx -y quick-acp@0.1.8 doctor
+   这个命令只读，会打印平台、Quick 数据目录、凭据可读性和 outpost 状态。
+   注意：不要用 --version 或 --help 验证——quick-acp 没有这两个参数，它会直接启动
+   ACP 服务并阻塞等待 stdin，看起来像卡住。
+3. 在 Codeg 打开 Settings → Agents → Add custom agent，按 npx 分发方式填写：
+   package 填 quick-acp@0.1.8，args 留空。
+4. 如果 Codeg 这一版只支持 command/args 形式，改填：
+   command = npx，args = ["-y", "quick-acp@0.1.8"]，
+   env 增加 QUICK_ACP_ALLOW_SHELL=1。
+5. 保存后新建一个 Quick 会话，发送一句普通提示（例如「列出当前目录下有哪些文件」），
+   确认三件事：能连上、工具调用真的执行了、回复里的文件名与实际一致。
+   如果提示需要登录，先运行 npx -y quick-acp-login --start-url <你的 SSO 入口>。
+6. 把最终填写的配置原样贴给我。
 
-### 7. 服务端工具事件叫 `tool_result`，不是 `tool_end`
+注意：
+- 不要修改我的账户设置、系统环境变量或全局 npm 配置。
+- 不要把任何 token 或凭据写进配置文件。
+- 如果 Codeg 版本与我说的入口名称不一致，以你实际看到的界面为准，并告诉我差异。
+````
 
-`tool_end` 在这个协议里根本不存在——那是第一版猜的名字，会静默匹配不到任何东西。真实名字见渲染层 `case 'tool_result'`。
+### T3 Code 配置
 
-这些都写进了 `src/quick/gateway-contract.ts`，并有测试断言。
+**T3 Code 在 Windows 上无法通过界面接入 quick-acp，必须手写配置文件。** 完整的排查过程、逐字段说明与 7 类常见卡点见 [T3 Code 配置教程](docs/T3Code配置教程.md)。这里给出可直接用的配置。
+
+前置：把仓库里的 [`scripts/t3-acp-compat.mjs`](scripts/t3-acp-compat.mjs) 放到一个固定路径。
+
+配置文件位置：`%USERPROFILE%\.t3\userdata\settings.json`（macOS/Linux 为 `~/.t3/userdata/settings.json`）
+
+```json
+{
+  "providerInstances": {
+    "quick-acp": {
+      "driver": "acpRegistry",
+      "displayName": "Quick ACP",
+      "enabled": true,
+      "config": {
+        "source": "local",
+        "commandPath": "E:\\Nodejs\\node.exe",
+        "commandArgs": [
+          "D:\\path\\to\\quick-acp\\scripts\\t3-acp-compat.mjs"
+        ]
+      }
+    }
+  }
+}
+```
+
+三条硬性要求，少一条就不工作：
+
+1. `commandPath` 必须是**原生 `node.exe` 的绝对路径**。T3 在 Windows 上以 `shell: false` 启动，硬拒 `.cmd`/`.bat`，而 npm 全局装的 `quick-acp` 恰好只有 `.cmd` shim。
+2. `commandArgs` 指向**兼容脚本**，不要指向 `main.js`。T3 会注入 40 个自带的 MCP 工具，quick-acp 会把它们的完整 JSON Schema 拼进上游提示词，帧涨到 100366 字节，顶爆网关 64 KB 上限。
+3. 文件必须是**无 BOM 的 UTF-8**，且改完**重启 T3**（T3 的配置缓存 TTL 是 infinity，没有文件监听）。
+
+**交给 AI 助手执行的提示词：**
+
+````text
+请帮我在 T3 Code 里配置 quick-acp 这个 ACP 智能体，我的系统是 Windows。
+
+背景（很重要，别跳过）：quick-acp 不在 ACP 官方 Registry 里，所以 T3 界面里的
+ACP Registry 搜不到它；界面上的 Enter manually 只能填 Registry ID，也用不了；
+Local ACP command 只有一个 Executable 输入框，而 T3 在 Windows 上会拒绝 .cmd/.bat
+并提示 "Local ACP commands launch without a shell"。所以只能改配置文件，不要浪费时间
+在界面上试。
+
+请按以下步骤操作，每步做完报告结果，任一步失败就停下说明原因，不要硬凑：
+
+1. 确认 T3 Code 已安装并至少启动过一次，检查这个文件所在目录是否存在：
+   %USERPROFILE%\.t3\userdata\
+   如果不存在，请先启动一次 T3 Code 再退出。
+
+2. 确认 Node.js 可执行文件的绝对路径：运行 where node，取第一行结果。
+
+3. 确认 quick-acp 已全局安装并能运行：
+   npm ls -g quick-acp --depth 0
+   node <第2步的路径> <npm 全局目录>\node_modules\quick-acp\dist\main.js --help
+   记下 main.js 的绝对路径。
+
+4. 在 <quick-acp 仓库目录>\scripts\t3-acp-compat.mjs 放一个兼容脚本。如果仓库里没有
+   这个文件，从 https://github.com/ana52070/Quick-acp 获取。这个脚本的作用是：转发
+   ACP stdio 消息，同时清空 session/new 里的 mcpServers——否则 T3 注入的 40 个 MCP
+   工具会让发给上游的提示词超过 64 KB，报 FrameTooLarge。
+
+5. 备份并写入 %USERPROFILE%\.t3\userdata\settings.json（注意：必须是 UTF-8 无 BOM，
+   不要用 PowerShell 的 Out-File 默认编码），内容为：
+   {
+     "providerInstances": {
+       "quick-acp": {
+         "driver": "acpRegistry",
+         "displayName": "Quick ACP",
+         "enabled": true,
+         "config": {
+           "source": "local",
+           "commandPath": "<第2步的 node.exe 绝对路径>",
+           "commandArgs": ["<第4步的兼容脚本绝对路径>"]
+         }
+       }
+     }
+   }
+   JSON 里的 Windows 路径反斜杠要转义成双反斜杠。
+
+6. 完全退出并重启 T3 Code（手改配置必须重启才生效，没有文件监听）。
+
+7. 用 T3 自带 CLI 验证，注意 --provider 和 --model 必须一起给：
+   & $env:USERPROFILE\.t3\bin\t3.cmd thread start --provider quick-acp --model default --wait --json "." "请列出当前工作区根目录下的所有一级子目录"
+   期望看到 status 为 completed，且 reply 里的目录名与实际一致。
+
+8. 如果报 FrameTooLarge，说明兼容脚本没生效，检查 commandArgs 是否指向兼容脚本而不是
+   main.js。如果报 Local ACP commands launch without a shell，说明 commandPath 填成了
+   .cmd 或 .bat。
+
+9. 把最终写入的配置原样贴给我（把绝对路径保留，不要贴任何 token）。
+
+注意：
+- 不要修改我的账户设置、系统环境变量或全局 npm 配置。
+- 不要改 quick-acp 的版本。
+- 不要提交或推送任何 git 变更。
+````
+
+### Zed 配置
+
+在 Zed 的 `settings.json` 中：
+
+```json
+{
+  "agent_servers": {
+    "Quick ACP": {
+      "type": "custom",
+      "command": "npx",
+      "args": ["-y", "quick-acp@0.1.8"],
+      "env": {
+        "QUICK_ACP_ALLOW_SHELL": "1"
+      }
+    }
+  }
+}
+```
+
+> Zed 的接入未经本项目实测，配置依据 ACP 标准形态给出。若遇到问题，欢迎按 [客户端接入问题模板](.github/ISSUE_TEMPLATE/client_compat.md) 反馈。
+
+### 其他 ACP 客户端
+
+任何支持「自定义 stdio ACP agent」的客户端都可以用同一组参数：命令 `npx`，参数 `["-y", "quick-acp@0.1.8"]`。需要时可加[环境变量速查](#环境变量速查)中的项。
 
 ---
 
-## 跑通它
+## 实测协议特性与运行说明
 
-**不需要复制任何 token。** 直接：
+经真实网关流量与契约实测验证的关键协议特征：
 
-```bash
-set QUICK_ACP_ALLOW_SHELL=1
-set QUICK_ACP_DEBUG=1
-node dist/main.js
-```
+1. **鉴权参数位置**：网关 WebSocket 握手必须在 URL 查询参数中提供 `?token=<jwt>`；使用 HTTP `Authorization: Bearer` 头会被网关拒绝（返回 401）。
+2. **必填 surfaceType**：握手参数必须包含 `?surfaceType=QUICK_WORK_DESKTOP_WINDOWS`。
+3. **真实连接路径**：网关双向流端点为 `/streaming/quickwork-chat-bidirectional-stream`。
+4. **空闲保活机制**：网关在空闲超过 95 秒无帧时会主动断开，Quick-acp 内部设置 45 秒定时发送 ping 帧维持心跳；在持续业务数据流交互时，业务入站帧能够正常维持保活，避免旧看门狗仅依靠控制 pong 造成的误杀。
+5. **多轮消息完成时机**：服务端推送的 `turn_usage` 早于真实的对话流收尾；必须以 `message_complete` 事件作为当前轮次结束的判定基准，确保后续工具结果不会被上一轮未关闭的会话吞并。
+6. **标准协议字段与自定义扩展划分**：
+   - **标准 ACP 规范字段**：会话生命周期严格适配标准 ACP 规范，声明 `protocolVersion: 1` 与 `agentCapabilities.loadSession: true`，会话通知完全使用标准类型（正文、思考流、工具调用卡片、`plan` 计划卡片与 `available_commands_update` 斜杠命令列表）；
+   - **非标准自定义扩展**：单轮 Token 消耗指标通过 `PromptResponse._meta.usage` 以及非标准扩展通知 `session/usage` 推送；会话列表与分叉通过 `session/list` 与 `session/fork` 扩展提供。
+7. **工具调用额度与截断规范 (0.1.8)**：默认单回合允许调用工具 12 次（失败调用亦计入额度），达到上限且任务未完成时返回 `stopReason: 'max_turn_requests'` 而非 `end_turn`，并输出中文进度与下一步操作提示；支持通过 `QUICK_ACP_MAX_TOOL_ROUNDS` 调整额度。
+8. **会话恢复与历史连续性**：`loadSession` 会在本地持久化历史记录的基础上恢复原上游线程；在续接或分叉 (`session/fork`) 后的首个提问中，会自动将父历史摘要注入给模型，确保模型在上游会话跨会话恢复时保持记忆连续。
+9. **生命周期与 MCP 隔离**：单轮对话取消 (`session/cancel`) 仅中断当前轮次推理与本地工具，**绝不关闭 MCP 服务**；仅在会话彻底销毁时清理 stdio 进程树或发送 HTTP DELETE 请求。
+10. **用户提问能力边界**：`ask_user_question` 底层映射为 ACP `requestPermission` 单选按钮，**仅支持单选按钮，不支持多选框或自由文本表单**。
 
-`main.js` 会自动完成：读凭据 → 刷新 token → 直连网关 → 接 ACP。
+---
 
-看 stderr：
+## 开发与测试
 
-- `[quick-acp:ws] connecting to …` 然后 `open` → 网关通了
-- `[quick-acp] MCP server registered and enabled (id …)` → 原生工具通道通了
-- `[quick-acp] falling back to prompt-injected tools …` → 没桌面端，工具走 inject
-- `[quick-acp] outpost not available: …` → 明确告诉你缺什么
+- **全套离线测试**：`npm test`
+  - 自动化运行 `build`、`probe`、`smoke`、`test:regression`（19 项核心回归、9 项路由专项、5 项根因专项）、`test:integration`（11 步）与 `test:budget`（8 项预算专项 + 2 项边界回归）。
+  - 纯离线运行，无需用户凭据或外网连接，适用于本地快速校验与 CI 流程。
+- **离线协议集成测试**：`node scripts/acp-offline-integration.mjs`
+  - 启动真实 `dist/main.js` 子进程并通过 stdio 进行完整 ACP JSON-RPC 交互，内建 Mock Upstream Gateway，验证全流程协议闭环。
+- **在线端到端验收**：`npm run test:live`
+  - 通过本地 `dist/main.js` 启动真实 ACP stdio 会话，由在线 Quick Claude 模型自主读取代码、生成报告、执行测试并回读。
+  - 需有效登录凭据、网络、Python 3.10及以上和 pygame。先运行 `python -m pip install -r examples/snake/requirements.txt`。
+- **打包校验**：`npm pack --dry-run`
+  - 验证发布包清单文件与 package.json / lockfile 保持一致。
 
-### 只想看它到底能不能跑
+---
 
-```bash
-node dist/e2e.js              # 端到端：ACP prompt → Quick → 模型 → ACP chunk
-node dist/inject-turn-test.js # 多轮对话 + 工具循环回归
-```
+## 贡献
 
-看到 `*** END-TO-END SUCCESS ***` 和 `all multi-turn checks passed` 就是全链路通了。
+欢迎提交 issue 与 PR。开始前请阅读：
 
+- [贡献指南](CONTRIBUTING.md) —— 开发环境、测试要求、发布流程
+- [行为准则](CODE_OF_CONDUCT.md)
+- [安全策略](SECURITY.md) —— 安全问题请走私密渠道，不要开公开 issue
+
+适合首次参与的方向：补 Zed 等未实测客户端的接入记录、补 MCP 外部服务联调用例、补 macOS 实机验证。
+
+---
+
+## 免责声明
+
+- 本项目为**非官方**第三方工具，与亚马逊 AWS、AWS Quick (Quickwork) 官方无任何关联、未获其背书或授权。
+- 你的对话内容会经由本项目提供的凭据发往 AWS Quick 服务，受其条款与隐私政策约束。本仓库不对上游服务的行为作任何保证。
+- 使用本项目可能与你所在组织或 AWS Quick 的服务条款存在冲突（例如以非官方客户端访问额度）。**使用前请自行确认合规性，风险自负。**
+- 本项目按「现状」提供，不附带任何明示或暗示的担保。因使用本项目造成的任何直接或间接损失，作者与贡献者不承担责任。
+- 模型生成的命令与文件改动由模型判断产生，请自行复核后再执行不可逆操作。
+
+---
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
+
+Copyright (c) 2026 quick-acp contributors
+
+第三方依赖的许可证与署名见 [NOTICE](NOTICE)。

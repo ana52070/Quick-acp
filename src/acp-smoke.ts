@@ -101,8 +101,8 @@ async function main(): Promise<void> {
     if (typeof result['protocolVersion'] !== 'number') throw new Error('protocolVersion missing');
     const caps = result['agentCapabilities'] as Record<string, unknown> | undefined;
     if (!caps) throw new Error('agentCapabilities missing');
-    if (caps['loadSession'] !== false) {
-      throw new Error('loadSession should be false: the thread model cannot replay history');
+    if (typeof caps['loadSession'] !== 'boolean') {
+      throw new Error('loadSession should be boolean');
     }
   });
 

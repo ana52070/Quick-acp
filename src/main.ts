@@ -15,7 +15,19 @@
  */
 
 import { AgentSideConnection, ndJsonStream } from '@zed-industries/agent-client-protocol';
+import type { AnyMessage } from '@zed-industries/agent-client-protocol';
 import { QuickAcpAgent } from './acp/agent.js';
+
+const STANDARD_AGENT_METHODS = new Set([
+  'authenticate',
+  'initialize',
+  'session/cancel',
+  'session/load',
+  'session/new',
+  'session/prompt',
+  'session/set_mode',
+  'session/set_model',
+]);
 
 async function main(): Promise<void> {
   const workspaceRoot = process.env.QUICK_ACP_WORKSPACE ?? process.cwd();
@@ -23,7 +35,7 @@ async function main(): Promise<void> {
   if (process.env.QUICK_ACP_PRINT_INFO === '1') {
     console.error('[quick-acp] workspace root:', workspaceRoot);
     console.error('[quick-acp] tools: prompt-injected (one extra turn per tool call)');
-    console.error('[quick-acp] shell enabled:', process.env.QUICK_ACP_ALLOW_SHELL === '1');
+    console.error('[quick-acp] shell enabled:', process.env.QUICK_ACP_ALLOW_SHELL !== '0');
   }
 
   const agent = new QuickAcpAgent({ workspaceRoot });
@@ -61,7 +73,28 @@ async function main(): Promise<void> {
     },
   });
 
-  const stream = ndJsonStream(output, input);
+  const rawStream = ndJsonStream(output, input);
+
+  // Translate non-standard extension requests (e.g. session/list, session/fork, session/resume)
+  // to leading underscore so AgentSideConnection routes them to agent.extMethod.
+  const adaptedReadable = rawStream.readable.pipeThrough(
+    new TransformStream<AnyMessage, AnyMessage>({
+      transform(msg: AnyMessage, controller) {
+        if (msg && typeof msg === 'object' && 'method' in msg && typeof (msg as any).method === 'string') {
+          const method = (msg as any).method as string;
+          if (!STANDARD_AGENT_METHODS.has(method) && !method.startsWith('_')) {
+            msg = { ...msg, method: `_${method}` } as AnyMessage;
+          }
+        }
+        controller.enqueue(msg);
+      },
+    }),
+  );
+
+  const stream = {
+    writable: rawStream.writable,
+    readable: adaptedReadable,
+  };
 
   // The connection hands us the Agent handler; we keep the connection so we can
   // push session/update notifications during a turn.
@@ -76,6 +109,7 @@ async function main(): Promise<void> {
     process.on('SIGTERM', () => resolve());
     process.on('SIGINT', () => resolve());
   });
+  await agent.closeAll();
 }
 
 main().catch((e) => {

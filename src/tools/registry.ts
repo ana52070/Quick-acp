@@ -227,7 +227,14 @@ export class ToolExecutor {
     return isAbsolute(raw) ? resolve(raw) : resolve(this.root, raw);
   }
 
-  async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+  async execute(
+    name: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<ToolResult> {
+    if (signal?.aborted) {
+      return { ok: false, content: 'refused: operation cancelled by caller', error: 'cancelled' };
+    }
     try {
       switch (name) {
         case 'file_read':
@@ -239,7 +246,7 @@ export class ToolExecutor {
         case 'file_search':
           return await this.fileSearch(args);
         case 'shell_run':
-          return await this.shellRun(args);
+          return await this.shellRun(args, signal);
         default:
           return { ok: false, content: `unknown tool: ${name}`, error: 'unknown_tool' };
       }
@@ -250,7 +257,11 @@ export class ToolExecutor {
   }
 
   private async fileRead(args: Record<string, unknown>): Promise<ToolResult> {
-    const path = this.resolveInside(String(args['path'] ?? ''));
+    const rawPath = String(args['path'] ?? args['file'] ?? args['filePath'] ?? '');
+    if (!rawPath.trim()) {
+      return { ok: false, content: 'refused: empty path', error: 'bad_path' };
+    }
+    const path = this.resolveInside(rawPath);
     const offset = positiveInt(args['offset'], 1);
     const limit = positiveInt(args['limit'], 2000);
     const text = await fs.readFile(path, 'utf8');
@@ -264,8 +275,12 @@ export class ToolExecutor {
   }
 
   private async fileWrite(args: Record<string, unknown>): Promise<ToolResult> {
-    const path = this.resolveInside(String(args['path'] ?? ''));
-    const content = String(args['content'] ?? '');
+    const rawPath = String(args['path'] ?? args['file'] ?? args['filePath'] ?? '');
+    if (!rawPath.trim()) {
+      return { ok: false, content: 'refused: empty path', error: 'bad_path' };
+    }
+    const path = this.resolveInside(rawPath);
+    const content = String(args['content'] ?? args['text'] ?? '');
     const bytes = Buffer.byteLength(content, 'utf8');
     if (bytes > this.policy.maxWriteBytes) {
       return {
@@ -280,7 +295,8 @@ export class ToolExecutor {
   }
 
   private async fileList(args: Record<string, unknown>): Promise<ToolResult> {
-    const dir = this.resolveInside(String(args['path'] ?? '.'));
+    const rawPath = String(args['path'] ?? args['dir'] ?? args['directory'] ?? '.');
+    const dir = this.resolveInside(rawPath);
     const recursive = args['recursive'] === true;
     const skip = new Set(['node_modules', '.git', 'dist', '.next', '__pycache__']);
     const out: string[] = [];
@@ -310,7 +326,7 @@ export class ToolExecutor {
   }
 
   private async fileSearch(args: Record<string, unknown>): Promise<ToolResult> {
-    const patternSource = String(args['pattern'] ?? '');
+    const patternSource = String(args['pattern'] ?? args['query'] ?? args['regex'] ?? '');
     if (!patternSource) return { ok: false, content: 'refused: empty pattern', error: 'bad_pattern' };
     let re: RegExp;
     try {
@@ -318,7 +334,8 @@ export class ToolExecutor {
     } catch (e) {
       return { ok: false, content: `invalid regular expression: ${String(e)}`, error: 'bad_pattern' };
     }
-    const dir = this.resolveInside(String(args['path'] ?? '.'));
+    const rawPath = String(args['path'] ?? args['dir'] ?? args['directory'] ?? '.');
+    const dir = this.resolveInside(rawPath);
     const globFilter = typeof args['glob'] === 'string' ? args['glob'] : '';
     const maxResults = positiveInt(args['maxResults'], 100);
     const skip = new Set(['node_modules', '.git', 'dist', '.next', '__pycache__']);
@@ -372,7 +389,10 @@ export class ToolExecutor {
     };
   }
 
-  private async shellRun(args: Record<string, unknown>): Promise<ToolResult> {
+  private async shellRun(
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<ToolResult> {
     if (!this.policy.allowShell) {
       return {
         ok: false,
@@ -380,7 +400,10 @@ export class ToolExecutor {
         error: 'shell_disabled',
       };
     }
-    const command = String(args['command'] ?? '');
+    if (signal?.aborted) {
+      return { ok: false, content: 'refused: command cancelled by caller', error: 'cancelled' };
+    }
+    const command = String(args['command'] ?? args['cmd'] ?? '');
     if (!command.trim()) return { ok: false, content: 'refused: empty command', error: 'bad_command' };
 
     for (const deny of this.policy.shellDenyPatterns) {
@@ -393,7 +416,8 @@ export class ToolExecutor {
       }
     }
 
-    const cwd = this.resolveInside(String(args['cwd'] ?? '.'));
+    const rawCwd = String(args['cwd'] ?? args['dir'] ?? args['workdir'] ?? '.');
+    const cwd = this.resolveInside(rawCwd);
     const timeoutMs = clampTimeout(args['timeoutMs'], this.policy.shellTimeoutMs);
     const isWindows = process.platform === 'win32';
 
@@ -402,20 +426,50 @@ export class ToolExecutor {
         cwd,
         shell: isWindows ? true : '/bin/sh',
         windowsHide: true,
+        detached: !isWindows,
         env: { ...process.env },
       });
+
+      // Avoid hanging on interactive commands waiting for stdin
+      try {
+        child.stdin?.end();
+      } catch {
+        /* ignore */
+      }
 
       let out = Buffer.alloc(0);
       let killedByTimeout = false;
       let killedBySize = false;
+      let killedBySignal = false;
       let settled = false;
 
       const settle = (result: ToolResult): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         resolvePromise(result);
       };
+
+      const onAbort = (): void => {
+        killedBySignal = true;
+        void killTree(child, child.pid);
+        setTimeout(() => {
+          settle({
+            ok: false,
+            content: `${out.toString('utf8')}\n[cancelled by caller]`,
+            error: 'cancelled',
+          });
+        }, 500);
+      };
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       const append = (chunk: Buffer): void => {
         out = Buffer.concat([out, chunk]);
@@ -456,15 +510,16 @@ export class ToolExecutor {
         settle({ ok: false, content: `failed to start: ${err.message}`, error: 'spawn_failed' });
       });
 
-      child.on('close', (code, signal) => {
+      child.on('close', (code, exitSignal) => {
         let text = out.toString('utf8');
         if (killedBySize) text += `\n[output truncated at ${this.policy.maxOutputBytes} bytes]`;
         if (killedByTimeout) text += `\n[timed out after ${timeoutMs}ms]`;
-        const ok = code === 0 && !killedByTimeout;
+        if (killedBySignal) text += '\n[cancelled by caller]';
+        const ok = code === 0 && !killedByTimeout && !killedBySignal;
         settle({
           ok,
           content: text || '(no output)',
-          ...(ok ? {} : { error: killedByTimeout ? 'timeout' : `exit_${code ?? signal}` }),
+          ...(ok ? {} : { error: killedBySignal ? 'cancelled' : killedByTimeout ? 'timeout' : `exit_${code ?? exitSignal}` }),
         });
       });
     });
@@ -472,15 +527,22 @@ export class ToolExecutor {
 }
 
 /**
- * Kill a process and everything it spawned.
+ * 终止进程及其派生的所有子孙进程树。
  *
- * On Windows `child.kill()` only signals the shell we launched; a grandchild
- * survives it, keeps the stdout pipe open, and prevents the `close` event from
- * ever firing. `taskkill /T` walks the tree. Elsewhere, killing the process
- * group (`-pid`) takes the children with it.
+ * Windows 平台：
+ * child.kill() 仅能向直属 shell 发送信号，孙进程仍存活并占用 stdio 管道，导致 close 无法触发。
+ * 使用 `taskkill /pid <pid> /T /F` 递归终止整棵进程树。
+ *
+ * POSIX 平台（Linux / macOS）：
+ * 注意：官方 @modelcontextprotocol/sdk 的 StdioClientTransport 在使用 cross-spawn 时
+ * 并未开启 `detached: true`，因此子进程并未成为独立的进程组组长（PGID 与主进程一致）。
+ * 此时使用 `process.kill(-pid)` 会因负 pid 不是进程组组长而抛出 ESRCH 错误，无法终止孙进程。
+ * 因此在 POSIX 下采用可靠进程树终止方案：
+ * 先通过 `pkill -9 -P <pid>` 级联终止所有直接/间接子进程，再对目标进程发送 SIGKILL 终止，
+ * 兜底尝试 child.kill('SIGKILL')。
  */
-function killTree(child: ChildProcess, pid: number | undefined): Promise<void> {
-  if (pid === undefined) return Promise.resolve();
+export async function killTree(child: ChildProcess | any, pid: number | undefined): Promise<void> {
+  if (pid === undefined || !Number.isFinite(pid)) return;
 
   if (process.platform === 'win32') {
     return new Promise<void>((done) => {
@@ -490,10 +552,8 @@ function killTree(child: ChildProcess, pid: number | undefined): Promise<void> {
       });
       killer.on('close', () => done());
       killer.on('error', () => {
-        // taskkill missing or refused: fall back to the single-process kill so
-        // the caller's backstop timer still settles the call.
         try {
-          child.kill('SIGKILL');
+          child?.kill?.('SIGKILL');
         } catch {
           /* already dead */
         }
@@ -502,19 +562,51 @@ function killTree(child: ChildProcess, pid: number | undefined): Promise<void> {
     });
   }
 
+  // Shell 使用独立进程组；SDK stdio 未必是组长，失败后按父子关系逐层清理。
   try {
-    // Negative pid == the process group, so children die too.
     process.kill(-pid, 'SIGKILL');
+    return;
+  } catch { /* 非独立进程组 */ }
+  const descendants = await new Promise<number[]>((done) => {
+    const listing = spawn('ps', ['-A', '-o', 'pid=', '-o', 'ppid='], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let output = '';
+    listing.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8'); });
+    listing.on('error', () => done([]));
+    listing.on('close', () => {
+      const children = new Map<number, number[]>();
+      for (const line of output.trim().split('\n')) {
+        const [id, parent] = line.trim().split(/\s+/).map(Number);
+        if (!id || !parent) continue;
+        children.set(parent, [...(children.get(parent) ?? []), id]);
+      }
+      const ordered: number[] = [];
+      const seen = new Set<number>([pid]);
+      const visit = (parent: number): void => {
+        for (const id of children.get(parent) ?? []) {
+          if (seen.has(id)) continue;
+          seen.add(id);
+          visit(id);
+          ordered.push(id);
+        }
+      };
+      visit(pid);
+      done(ordered);
+    });
+  });
+  for (const id of descendants) {
+    try { process.kill(id, 'SIGKILL'); } catch { /* 子进程已退出 */ }
+  }
+
+  try {
+    process.kill(pid, 'SIGKILL');
   } catch {
     try {
-      child.kill('SIGKILL');
+      child?.kill?.('SIGKILL');
     } catch {
       /* already dead */
     }
   }
-  return Promise.resolve();
 }
-
 // ---------------------------------------------------------------------------
 
 function positiveInt(v: unknown, fallback: number): number {

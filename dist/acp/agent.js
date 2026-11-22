@@ -1,55 +1,46 @@
 /**
- * ACP agent implementation backed by the Quick gateway.
+ * Quick-acp ACP 执行代理实现。
  *
- * This is the adaptor T3Code / codeg / any ACP client talks to. It speaks
- * standard ACP over stdio and forwards turns to the Quick session.
- *
- * Mapping notes (each one is a real semantic loss, stated rather than hidden):
- *
- *   - ACP `prompt` gives the full `content` of ONE new user turn, not history.
- *     That matches Quick's thread model exactly: each prompt is an increment.
- *   - ACP `newSession` maps to a fresh Quick thread.
- *   - ACP `setSessionMode` maps to Quick `agent_mode`; the mode list is
- *     Quick's ('fast'/'balanced'/'smart'), not a generic ask/code/architect set.
- *   - ACP `setSessionModel` is refused: Quick does not let a caller pick the
- *     model. Reporting a successful model switch would be a lie.
- *   - Tool calls are executed by this process and reported through
- *     `session/update` so the client renders them like any other agent's.
+ * 作为 codeg / Zed 等标准 ACP 客户端与 Quick 网关之间的协议适配器。
+ * 通过 stdio 承载标准 ACP (JSON-RPC) 通信，并向上游 Quick 协议会话流式转发对话轮次。
  */
 import { RequestError } from '@zed-industries/agent-client-protocol';
+import { randomUUID } from 'node:crypto';
 import { resolveSession } from '../quick/auth.js';
 import { QuickTransport } from '../quick/transport.js';
 import { QuickChatSession, } from '../quick/session.js';
 import { defaultPolicy, toolDefs, ToolExecutor } from '../tools/registry.js';
-import { resolveToolMode, runWithInjectedTools } from '../tools/strategies.js';
-/** ACP protocol revision this agent implements. */
+import { extractBalancedJson, parseToolCall, resolveToolMode, runWithInjectedTools, } from '../tools/strategies.js';
+import { saveSession, readSession, listPersistedSessions, forkPersistedSession, } from '../session/persistence.js';
+import { SessionMcpManager } from '../mcp/manager.js';
+import { planToolDef, SessionPlanManager } from '../features/plan.js';
+import { SkillManager, skillReadToolDef } from '../features/skills.js';
+import { PermissionGate, askUserQuestionToolDef, isInteractiveEnvironment } from '../features/permission.js';
+import { ClientFsDelegate } from '../features/fs-delegate.js';
+import { runWithClassifiedRetry } from '../features/retry.js';
+/** ACP 协议版本号 */
 const PROTOCOL_VERSION = 1;
 /**
- * Removes the tool-call contract from the user-visible text stream.
- *
- * WHY THIS EXISTS
- * ---------------
- * The inject strategy asks the model to answer a tool need with a fenced block:
- *
- *   ```quick-tool-call
- *   {"name": "shell_run", "arguments": {"command": "cd"}}
- *   ```
- *
- * That block is an instruction to US, not something to show. But text arrives as
- * deltas, so the first fragments of it were already streamed to the client before
- * the parser had seen the whole thing — the user got a wall of JSON followed by
- * the real answer, and the client rendered it as chat prose because it genuinely
- * was chat prose by then.
- *
- * So the delta stream is filtered rather than the final string: hold back just
- * enough characters to know whether a block is starting (the marker is short),
- * and once inside one, drop everything until it closes.
+ * 校验工具名称是否为 Quick 云端原生设备工具。
+ * 当模型被 Quick 上游环境误导尝试调用设备端 Python/Bash 执行时，必须在本地代理层拦截。
  */
-class ToolCallFilter {
+export function isNativeDeviceTool(name) {
+    const lower = (name || '').toLowerCase();
+    return (lower === 'run_python_on_device' ||
+        lower.includes('on_device') ||
+        lower.startsWith('device_') ||
+        lower.endsWith('_on_device') ||
+        lower === 'run_python' ||
+        lower === 'run_bash_on_device' ||
+        lower === 'execute_command_on_device' ||
+        lower === 'device_terminal');
+}
+/**
+ * 流式文本过滤器：剔除流式输出中的工具调用协议 JSON 块，防止污染用户 UI 正文。
+ */
+export class ToolCallFilter {
     emit;
-    /** Everything received but not yet emitted or discarded. */
     held = '';
-    /** True once a tool-call block has started and not yet closed. */
     inside = false;
     constructor(emit) {
         this.emit = emit;
@@ -58,18 +49,29 @@ class ToolCallFilter {
         this.held += delta;
         for (;;) {
             if (this.inside) {
-                const close = this.held.indexOf(TOOL_CALL_CLOSE);
-                if (close < 0)
-                    return; // still inside; wait for more
-                this.held = this.held.slice(close + TOOL_CALL_CLOSE.length);
-                this.inside = false;
-                continue;
+                let candidateFenceIdx = this.held.indexOf('```');
+                let foundRealClose = false;
+                while (candidateFenceIdx !== -1) {
+                    const body = this.held.slice(0, candidateFenceIdx);
+                    if (extractBalancedJson(body, 0) && parseToolCall(body)) {
+                        const afterFence = this.held.slice(candidateFenceIdx);
+                        const fenceMatch = afterFence.match(/^`{3,}/);
+                        const fenceLen = fenceMatch ? fenceMatch[0].length : 3;
+                        this.held = this.held.slice(candidateFenceIdx + fenceLen);
+                        this.inside = false;
+                        foundRealClose = true;
+                        break;
+                    }
+                    candidateFenceIdx = this.held.indexOf('```', candidateFenceIdx + 3);
+                }
+                if (foundRealClose) {
+                    continue;
+                }
+                return;
             }
-            const open = this.held.indexOf(TOOL_CALL_OPEN);
-            if (open < 0) {
-                // No marker yet. Emit everything except a tail that could still become
-                // the start of one, so a marker split across deltas is still caught.
-                const keep = Math.min(this.held.length, TOOL_CALL_OPEN.length - 1);
+            const openMatch = this.held.match(/`{3,}(?:quick-tool-call|quick_tool_call|tool-call|tool_call)\b[^\n]*\r?\n?/i);
+            if (!openMatch || openMatch.index === undefined) {
+                const keep = Math.min(this.held.length, 32);
                 const cut = this.held.length - keep;
                 if (cut <= 0)
                     return;
@@ -79,32 +81,51 @@ class ToolCallFilter {
                     await this.emit(safe);
                 return;
             }
-            const before = this.held.slice(0, open);
+            const before = this.held.slice(0, openMatch.index);
             if (before)
                 await this.emit(before);
-            this.held = this.held.slice(open + TOOL_CALL_OPEN.length);
+            this.held = this.held.slice(openMatch.index + openMatch[0].length);
             this.inside = true;
         }
     }
-    /** Emit whatever is left once the turn is over. */
     async flush() {
-        const rest = this.inside ? '' : this.held;
+        if (this.inside) {
+            this.held = '';
+            this.inside = false;
+            return;
+        }
+        if (parseToolCall(this.held)) {
+            this.held = '';
+            return;
+        }
+        const rest = this.held;
         this.held = '';
-        this.inside = false;
         if (rest)
             await this.emit(rest);
     }
 }
-const TOOL_CALL_OPEN = '```quick-tool-call';
-const TOOL_CALL_CLOSE = '```';
-function buildSessionTools(workspaceRoot) {
-    const policy = defaultPolicy(workspaceRoot);
-    return {
-        workspaceRoot,
-        policy,
-        tools: toolDefs(policy),
-        executor: new ToolExecutor(policy),
-    };
+/** 将持久化历史记录格式化为上下文注入字符串，确保新线程/分叉会话恢复记忆 */
+function buildHistoryTranscriptContext(turns) {
+    if (!turns || turns.length === 0)
+        return '';
+    const lines = ['[上轮对话历史上下文 - 供续接记忆]'];
+    for (const turn of turns) {
+        if (turn.role === 'user') {
+            lines.push(`用户: ${turn.text}`);
+        }
+        else if (turn.role === 'assistant') {
+            let asst = turn.text;
+            if (turn.toolCalls && turn.toolCalls.length > 0) {
+                const calls = turn.toolCalls
+                    .map((tc) => `[工具调用: ${tc.toolName} ${tc.ok ? '成功' : '失败'}]`)
+                    .join(' ');
+                asst = asst ? `${asst}\n${calls}` : calls;
+            }
+            lines.push(`助手: ${asst}`);
+        }
+    }
+    lines.push('[历史上下文结束，请基于上述记忆继续响应]');
+    return lines.join('\n');
 }
 export class QuickAcpAgent {
     sessions = new Map();
@@ -113,27 +134,50 @@ export class QuickAcpAgent {
     toolMode;
     fallbackWorkspace;
     conn = null;
+    clientFsDelegate = new ClientFsDelegate();
+    shutdownRegistered = false;
     constructor(opts = {}) {
-        // Only a FALLBACK. The real workspace comes from `session/new`'s `cwd`,
-        // which is the folder the user picked in the ACP client — that is the
-        // protocol's own mechanism and the only one that should matter.
         this.fallbackWorkspace = opts.workspaceRoot ?? process.cwd();
         this.toolMode = resolveToolMode();
+        this.registerProcessHooks();
     }
-    /** Called by main once the connection exists, so we can emit updates. */
+    registerProcessHooks() {
+        if (this.shutdownRegistered)
+            return;
+        this.shutdownRegistered = true;
+        const cleanup = () => {
+            void this.closeAll();
+        };
+        process.once('SIGINT', cleanup);
+        process.once('SIGTERM', cleanup);
+        process.once('exit', cleanup);
+    }
     attach(conn) {
         this.conn = conn;
     }
+    async closeAll() {
+        for (const session of this.sessions.values()) {
+            try {
+                session.cancelled = true;
+                session.abortController?.abort();
+                session.chat.cancel();
+                session.chat.close?.();
+                await session.mcpManager.close();
+            }
+            catch { }
+        }
+    }
     // -------------------------------------------------------------------------
-    // ACP: lifecycle
+    // ACP: 生命周期
     // -------------------------------------------------------------------------
-    async initialize(_params) {
+    async initialize(params) {
+        if (params.clientCapabilities) {
+            this.clientFsDelegate.setClientCapabilities(params.clientCapabilities);
+        }
         return {
             protocolVersion: PROTOCOL_VERSION,
             agentCapabilities: {
-                // We stream incremental text, so loadSession stays false: replaying a
-                // full history is not something the Quick thread model supports.
-                loadSession: false,
+                loadSession: true, // 完整支持：本地持久化重放、原线程续接与分叉上下文注入
                 promptCapabilities: {
                     image: true,
                     audio: false,
@@ -144,14 +188,7 @@ export class QuickAcpAgent {
         };
     }
     async newSession(params) {
-        // ACP's own workspace mechanism: the client sends the folder the user
-        // picked, and every tool call in this session is jailed to it. Falling back
-        // to the process cwd only when a client sends nothing.
         const cwd = typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : this.fallbackWorkspace;
-        // Each ACP session gets its OWN gateway socket and its own Quick thread, so
-        // two conversations in the client map to two independent Quick threads.
-        // Turns within one session are serialized by the gateway's thread model;
-        // sessions run independently of each other.
         const quick = await this.quick();
         const transport = new QuickTransport(quick, {
             onTokenRefreshNeeded: async () => {
@@ -172,30 +209,49 @@ export class QuickAcpAgent {
             thinkingEffort: 'high',
         });
         await chat.open();
-        // The session id must be unique ACROSS PROCESS LIFETIMES, not just within
-        // this one.
-        //
-        // It used to be `quick-${++this.sessionSeq}`, which restarts at 1 on every
-        // agent start. codeg remembers which conversation a session is bound to, so
-        // the second conversation to ever use the agent was told:
-        //
-        //   conflict: agent session quick-1 is already bound to conversation 770;
-        //   refusing to move it onto conversation 771
-        //
-        // and could never send a message. The Quick thread id is a UUID that this
-        // session owns for its whole life, so reusing it gives an id that is unique
-        // for real (and correlates with the thread in any server-side logs).
         const id = chat.ensureThread();
-        this.sessions.set(id, {
+        const mcpManager = new SessionMcpManager(++this.sessionSeq);
+        if (Array.isArray(params.mcpServers)) {
+            await mcpManager.mountServers(params.mcpServers);
+        }
+        const planManager = new SessionPlanManager();
+        const skillManager = new SkillManager();
+        await skillManager.discover(cwd);
+        const permissionGate = new PermissionGate();
+        const persisted = {
+            sessionId: id,
+            threadId: id,
+            cwd,
+            title: `会话 ${id.slice(0, 8)}`,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            agentMode: 'smart',
+            turns: [],
+        };
+        await saveSession(persisted);
+        const sessionTools = this.buildSessionTools(id, cwd, mcpManager, planManager, skillManager, permissionGate);
+        const state = {
             id,
             chat,
             transport,
             agentMode: 'smart',
             thinkingEffort: 'high',
             cancelled: false,
+            abortController: null,
+            activePrompt: false,
             cwd,
-            sessionTools: buildSessionTools(cwd),
-        });
+            sessionTools,
+            mcpManager,
+            planManager,
+            skillManager,
+            permissionGate,
+            persisted,
+            historyInjected: true,
+        };
+        this.sessions.set(id, state);
+        setTimeout(() => {
+            void this.emitAvailableCommands(id, skillManager.getAvailableCommands());
+        }, 10);
         return {
             sessionId: id,
             modes: {
@@ -204,19 +260,119 @@ export class QuickAcpAgent {
                     {
                         id: 'fast',
                         name: 'Fast',
-                        description: 'Quickest responses, no extended thinking. Maps to Quick mode "fast".',
+                        description: '快速响应，关闭深度思考。对应 Quick 的 fast 档位。',
                     },
                     {
                         id: 'balanced',
                         name: 'Balanced',
-                        description: 'Balances quality and speed. Maps to Quick mode "balanced".',
+                        description: '平衡响应质量与速度。对应 Quick 的 balanced 档位。',
                     },
                     {
                         id: 'smart',
                         name: 'Smart',
-                        description: 'Highest quality with extended thinking. Maps to Quick mode "smart", which is ' +
-                            'the tier that routes to the strongest available model.',
+                        description: '最高质量，启用 Extended Thinking 思考流。对应 Quick 的 smart 最优模型。',
                     },
+                ],
+            },
+        };
+    }
+    async loadSession(params) {
+        const previous = this.sessions.get(params.sessionId);
+        if (previous?.activePrompt) {
+            throw new RequestError(-32600, '无法在对话执行期间重新加载会话');
+        }
+        if (previous) {
+            previous.chat.close();
+            await previous.mcpManager.close();
+            this.sessions.delete(params.sessionId);
+        }
+        const persisted = await readSession(params.sessionId);
+        if (!persisted) {
+            throw RequestError.resourceNotFound(`未找到持久化会话 ${params.sessionId}`);
+        }
+        const cwd = typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : persisted.cwd;
+        const quick = await this.quick();
+        const transport = new QuickTransport(quick, {
+            onTokenRefreshNeeded: async () => {
+                try {
+                    const fresh = await resolveSession();
+                    this.quickSession = fresh;
+                    return fresh.jwt;
+                }
+                catch {
+                    return null;
+                }
+            },
+        });
+        const chat = new QuickChatSession({
+            transport,
+            actorArn: quick.actorArn,
+            agentMode: persisted.agentMode || 'smart',
+            thinkingEffort: 'high',
+        });
+        await chat.open();
+        // 真正恢复上游 Quick 线程 ID 续接会话
+        chat.ensureThread(persisted.threadId);
+        const id = params.sessionId;
+        const mcpManager = new SessionMcpManager(++this.sessionSeq);
+        if (Array.isArray(params.mcpServers)) {
+            await mcpManager.mountServers(params.mcpServers);
+        }
+        const planManager = new SessionPlanManager();
+        const skillManager = new SkillManager();
+        await skillManager.discover(cwd);
+        const permissionGate = new PermissionGate();
+        const sessionTools = this.buildSessionTools(id, cwd, mcpManager, planManager, skillManager, permissionGate);
+        const state = {
+            id,
+            chat,
+            transport,
+            agentMode: persisted.agentMode || 'smart',
+            thinkingEffort: 'high',
+            cancelled: false,
+            abortController: null,
+            activePrompt: false,
+            cwd,
+            sessionTools,
+            mcpManager,
+            planManager,
+            skillManager,
+            permissionGate,
+            persisted,
+            // load 恢复后首轮提示词注入历史摘要，防止上游线程过期时模型失忆
+            historyInjected: false,
+        };
+        this.sessions.set(id, state);
+        // 向客户端 UI 完整重放历史消息、思考过程与工具调用卡片
+        for (const turn of persisted.turns) {
+            if (turn.role === 'user') {
+                await this.emitUserMessage(id, turn.text);
+            }
+            else if (turn.role === 'assistant') {
+                if (turn.thought) {
+                    await this.emitThought(id, turn.thought);
+                }
+                if (turn.text) {
+                    await this.emitText(id, turn.text);
+                }
+                if (turn.toolCalls) {
+                    for (const tc of turn.toolCalls) {
+                        await this.emitToolStart(state, tc.toolName, tc.args, tc.toolCallId);
+                        await this.emitToolResult(state, tc.toolName, tc.args, tc.result, tc.ok ?? true, tc.toolCallId);
+                    }
+                }
+            }
+        }
+        setTimeout(() => {
+            void this.emitAvailableCommands(id, skillManager.getAvailableCommands());
+        }, 10);
+        return {
+            modes: {
+                currentModeId: state.agentMode,
+                availableModes: [
+                    { id: 'fast', name: 'Fast', description: '快速响应，关闭深度思考。' },
+                    { id: 'balanced', name: 'Balanced', description: '平衡质量与速度。' },
+                    { id: 'smart', name: 'Smart', description: '最高质量，启用 Extended Thinking 思考流。' },
                 ],
             },
         };
@@ -228,128 +384,610 @@ export class QuickAcpAgent {
             throw RequestError.invalidParams({ modeId: mode });
         }
         session.agentMode = mode;
-        // Fast has no thinking control in Quick; the others keep the current effort.
         if (mode === 'fast')
             session.thinkingEffort = 'off';
+        // 联动持久化保存会话模式
+        session.persisted.agentMode = mode;
+        await saveSession(session.persisted);
+        await this.emitModeUpdate(session.id, mode);
     }
-    /**
-     * Quick does not let a caller choose the model, so this is refused rather
-     * than silently accepted. The resolved model is reported per turn instead.
-     */
     async setSessionModel(params) {
-        throw new RequestError(-32601, 'Quick does not expose model selection. The gateway routes the model ' +
-            'server-side; per-turn usage reports `resolved_model_id`.', { requestedModelId: params.modelId });
+        throw new RequestError(-32601, 'Quick does not expose model selection. Quick 不支持客户端主动切换模型。网关服务端统一路由模型；每轮 turn usage 均如实返回 resolvedModelId。', { requestedModelId: params.modelId });
     }
     async authenticate() {
-        // No ACP-level auth: the Quick session comes from the desktop app.
+        // ACP 层面无需额外鉴权，使用本地凭据或单点登录凭据
     }
     // -------------------------------------------------------------------------
-    // ACP: prompt turn
+    // ACP: prompt 对话轮次
     // -------------------------------------------------------------------------
     async prompt(params) {
         const session = this.requireSession(params.sessionId);
-        session.cancelled = false;
-        const { text: userText, attachments } = extractContent(params.prompt);
-        if (!userText.trim() && attachments.length === 0) {
-            return { stopReason: 'end_turn' };
+        // 并发保护：同 session 不允许重叠执行 prompt，防止覆盖 AbortController 及持久化记录竞态冲突
+        if (session.activePrompt) {
+            throw new RequestError(-32600, `Session ${params.sessionId} already has an active prompt in progress.`, { sessionId: params.sessionId });
         }
+        session.activePrompt = true;
+        session.cancelled = false;
+        session.abortController = new AbortController();
         try {
-            const result = await this.runTurn(session, userText, attachments);
+            let { text: userText, attachments } = extractContent(params.prompt);
+            if (!userText.trim() && attachments.length === 0) {
+                return { stopReason: 'end_turn' };
+            }
+            // 1. 处理斜杠命令与本地内置拦截（/help, /mode, /plan, /clear）
+            const parsed = session.skillManager.processPrompt(userText);
+            if (parsed.type === 'builtin') {
+                return await this.handleBuiltinSlashCommand(session, parsed.command, parsed.arg, userText);
+            }
+            if (parsed.type === 'skill') {
+                userText = parsed.processedText;
+            }
+            // 2. 检查是否需要注入历史记忆（如 loadSession 或 fork 后的首个提问）
+            let promptToSend = userText;
+            if (!session.historyInjected && session.persisted.turns.length > 0) {
+                const historyContext = buildHistoryTranscriptContext(session.persisted.turns);
+                promptToSend = `${historyContext}\n\n---\n\n${userText}`;
+                session.historyInjected = true;
+            }
+            // 3. 记录用户轮次并更新会话标题
+            session.persisted.turns.push({
+                role: 'user',
+                text: userText,
+                timestamp: Date.now(),
+            });
+            if (session.persisted.title.startsWith('会话 ') ||
+                session.persisted.title.startsWith('Session ')) {
+                const summary = userText.trim().split('\n')[0].slice(0, 32);
+                if (summary)
+                    session.persisted.title = summary;
+            }
+            await saveSession(session.persisted);
+            const result = await this.runTurn(session, promptToSend, attachments);
+            // 4. 记录助手响应轮次已在 runTurn 内部组装完整的 thought 与 toolCalls 后落盘
             if (result.cancelled) {
                 return { stopReason: 'cancelled' };
             }
-            return { stopReason: 'end_turn' };
+            if (result.exhausted) {
+                const response = {
+                    stopReason: 'max_turn_requests',
+                    ...(result.usage ? { _meta: { usage: result.usage } } : {}),
+                };
+                if (result.usage && this.conn) {
+                    try {
+                        await this.conn.extNotification('session/usage', {
+                            sessionId: params.sessionId,
+                            usage: result.usage,
+                        });
+                    }
+                    catch {
+                        /* 客户端若不支持该扩展通知则静默忽略 */
+                    }
+                }
+                return response;
+            }
+            const response = {
+                stopReason: 'end_turn',
+                ...(result.usage ? { _meta: { usage: result.usage } } : {}),
+            };
+            // 5. 非标准扩展通知：推送单轮 Token 消耗指标 (SDK usage 扩展)
+            if (result.usage && this.conn) {
+                try {
+                    await this.conn.extNotification('session/usage', {
+                        sessionId: params.sessionId,
+                        usage: result.usage,
+                    });
+                }
+                catch {
+                    /* 客户端若不支持该扩展通知则静默忽略 */
+                }
+            }
+            return response;
         }
         catch (e) {
+            if (e instanceof RequestError) {
+                throw e;
+            }
             const message = e instanceof Error ? e.message : String(e);
-            // Surface protocol-level failures as a refusal the client can render,
-            // with the reason intact instead of a generic internal error.
-            throw new RequestError(-32000, message, { sessionId: params.sessionId });
+            throw new RequestError(-32603, message, { sessionId: params.sessionId });
         }
+        finally {
+            session.activePrompt = false;
+            session.abortController = null;
+        }
+    }
+    /**
+     * 本地拦截执行内置命令，直接生成助手回复并写入持久化，不调用上游模型
+     */
+    async handleBuiltinSlashCommand(session, command, arg, rawUserText) {
+        let replyText = '';
+        if (command === 'help') {
+            const skills = session.skillManager.getAllSkills();
+            const skillText = skills.length > 0
+                ? skills.map((s) => `  - **/${s.name}**: ${s.description}`).join('\n')
+                : '  （当前未发现挂载技能）';
+            replyText = [
+                '### Quick-acp 辅助指南',
+                '',
+                `**当前会话档位**: \`${session.agentMode}\``,
+                `**当前工作目录**: \`${session.cwd}\``,
+                '',
+                '**内置命令**:',
+                '  - `/help`: 查看帮助与可用工具',
+                '  - `/mode [fast|balanced|smart]`: 查看或切换推理档位',
+                '  - `/plan`: 查看当前任务步骤执行计划',
+                '  - `/clear`: 清空会话线程与历史',
+                '',
+                '**已加载本地技能**:',
+                skillText,
+                '',
+                '**基础工具支持**: `file_read`, `file_write`, `file_list`, `file_search`, `shell_run`, `plan_update`, `skill_read` 等。',
+            ].join('\n');
+        }
+        else if (command === 'mode') {
+            if (arg) {
+                const target = arg.toLowerCase();
+                if (target === 'fast' || target === 'balanced' || target === 'smart') {
+                    session.agentMode = target;
+                    session.persisted.agentMode = target;
+                    await saveSession(session.persisted);
+                    await this.emitModeUpdate(session.id, target);
+                    replyText = `已将当前会话模式切换为: **${target}**`;
+                }
+                else {
+                    replyText = `无效的模式 "${arg}"。可选档位: \`fast\`, \`balanced\`, \`smart\``;
+                }
+            }
+            else {
+                replyText = `当前会话模式为: **${session.agentMode}** (可选切换: \`/mode fast\`, \`/mode balanced\`, \`/mode smart\`)`;
+            }
+        }
+        else if (command === 'plan') {
+            replyText = session.planManager.formatAsMarkdown();
+        }
+        else if (command === 'clear') {
+            session.chat.resetThread();
+            const newThread = session.chat.ensureThread();
+            session.persisted.threadId = newThread;
+            session.persisted.turns = [];
+            session.planManager.reset();
+            await saveSession(session.persisted);
+            replyText = '已重置并清空当前会话线程，历史上下文已重置。';
+        }
+        await this.emitText(session.id, replyText);
+        // 记录内置命令及回复至本地持久化
+        session.persisted.turns.push({
+            role: 'user',
+            text: rawUserText,
+            timestamp: Date.now(),
+        });
+        session.persisted.turns.push({
+            role: 'assistant',
+            text: replyText,
+            timestamp: Date.now(),
+        });
+        await saveSession(session.persisted);
+        return { stopReason: 'end_turn' };
     }
     async cancel(params) {
         const session = this.sessions.get(params.sessionId);
         if (!session)
             return;
         session.cancelled = true;
+        session.abortController?.abort();
         session.chat.cancel();
     }
-    async extMethod(method) {
-        throw new RequestError(-32601, `unsupported extension method: ${method}`);
+    async extMethod(method, params = {}) {
+        const norm = method.replace(/^_+/, '');
+        if (norm === 'session/list' || norm === 'list_sessions') {
+            const cwd = typeof params['cwd'] === 'string' ? params['cwd'] : null;
+            const list = await listPersistedSessions(cwd);
+            return { sessions: list };
+        }
+        if (norm === 'session/resume') {
+            const sessionId = String(params['sessionId'] ?? '');
+            const cwd = String(params['cwd'] ?? '');
+            const resp = await this.loadSession({ sessionId, cwd });
+            return resp;
+        }
+        if (norm === 'session/fork') {
+            const parentSessionId = String(params['sessionId'] ?? '');
+            const newSessionId = randomUUID();
+            const cwd = typeof params['cwd'] === 'string' ? params['cwd'] : undefined;
+            const forked = await forkPersistedSession(parentSessionId, newSessionId, cwd);
+            if (!forked) {
+                throw RequestError.resourceNotFound(`未找到父会话 ${parentSessionId} 进行分叉`);
+            }
+            // 真正恢复分叉会话状态并绑定正确的 newSessionId
+            const quick = await this.quick();
+            const transport = new QuickTransport(quick, {
+                onTokenRefreshNeeded: async () => {
+                    try {
+                        const fresh = await resolveSession();
+                        this.quickSession = fresh;
+                        return fresh.jwt;
+                    }
+                    catch {
+                        return null;
+                    }
+                },
+            });
+            const chat = new QuickChatSession({
+                transport,
+                actorArn: quick.actorArn,
+                agentMode: forked.agentMode || 'smart',
+                thinkingEffort: 'high',
+            });
+            await chat.open();
+            chat.ensureThread(forked.threadId);
+            const mcpManager = new SessionMcpManager(++this.sessionSeq);
+            if (Array.isArray(params['mcpServers'])) {
+                await mcpManager.mountServers(params['mcpServers']);
+            }
+            const planManager = new SessionPlanManager();
+            const skillManager = new SkillManager();
+            await skillManager.discover(forked.cwd);
+            const permissionGate = new PermissionGate();
+            const sessionTools = this.buildSessionTools(newSessionId, forked.cwd, mcpManager, planManager, skillManager, permissionGate);
+            const state = {
+                id: newSessionId,
+                chat,
+                transport,
+                agentMode: forked.agentMode || 'smart',
+                thinkingEffort: 'high',
+                cancelled: false,
+                abortController: null,
+                activePrompt: false,
+                cwd: forked.cwd,
+                sessionTools,
+                mcpManager,
+                planManager,
+                skillManager,
+                permissionGate,
+                persisted: forked,
+                historyInjected: false,
+            };
+            this.sessions.set(newSessionId, state);
+            return {
+                sessionId: newSessionId,
+                modes: {
+                    currentModeId: state.agentMode,
+                    availableModes: [
+                        { id: 'fast', name: 'Fast', description: '快速响应，关闭深度思考。' },
+                        { id: 'balanced', name: 'Balanced', description: '平衡质量与速度。' },
+                        { id: 'smart', name: 'Smart', description: '最高质量，启用 Extended Thinking 思考流。' },
+                    ],
+                },
+            };
+        }
+        if (norm === 'session/close' || norm === 'close_session') {
+            const sessionId = String(params['sessionId'] ?? '');
+            const s = this.sessions.get(sessionId);
+            if (s) {
+                s.cancelled = true;
+                s.abortController?.abort();
+                s.chat.cancel();
+                s.chat.close();
+                await s.mcpManager.close();
+                this.sessions.delete(sessionId);
+                return { ok: true };
+            }
+            return { ok: false, message: '会话不存在' };
+        }
+        throw RequestError.methodNotFound(method);
     }
     async extNotification() {
-        // Ignored by design.
+        // 按规范忽略未知扩展通知
     }
     // -------------------------------------------------------------------------
-    // turn execution
+    // 工具注册与执行路由
+    // -------------------------------------------------------------------------
+    buildSessionTools(sessionId, workspaceRoot, mcpManager, planManager, skillManager, permissionGate) {
+        const policy = defaultPolicy(workspaceRoot);
+        const baseExecutor = new ToolExecutor(policy);
+        // 仅在具备可交互式 ACP 客户端支持时向模型暴露 ask_user_question
+        const canAsk = isInteractiveEnvironment(this.conn);
+        const tools = [
+            ...toolDefs(policy),
+            planToolDef(),
+            skillReadToolDef(),
+            ...(canAsk ? [askUserQuestionToolDef()] : []),
+            ...mcpManager.registeredTools,
+        ];
+        const executor = {
+            execute: async (name, args, signal, toolCallId) => {
+                if (signal?.aborted) {
+                    return { ok: false, content: '操作已被调用者取消', error: 'cancelled' };
+                }
+                const callId = toolCallId ?? `call-${Date.now()}`;
+                const title = toolTitle(name, args);
+                // 1. 权限审批网关（严格区分 auto 与 ask 模式；ask 模式下包含 MCP 工具授权）
+                const perm = await permissionGate.checkPermission({
+                    conn: this.conn,
+                    sessionId,
+                    toolCallId: callId,
+                    toolName: name,
+                    args,
+                    title,
+                    signal,
+                });
+                if (!perm.allowed) {
+                    return {
+                        ok: false,
+                        content: `操作被拒绝: ${perm.reason ?? '权限未获批准'}`,
+                        error: 'permission_denied',
+                    };
+                }
+                // 2. 路由 MCP 工具调用
+                if (name.startsWith('mcp__')) {
+                    const mcpRes = await mcpManager.executeMcpTool(name, args, signal);
+                    if (mcpRes) {
+                        return { ok: mcpRes.ok, content: mcpRes.content };
+                    }
+                    return { ok: false, content: `未找到 MCP 工具 ${name}`, error: 'not_found' };
+                }
+                // 3. 路由 plan_update 工具
+                if (name === 'plan_update') {
+                    const planRes = planManager.updateFromRaw(args);
+                    await this.emitPlan(sessionId, planManager.plan);
+                    return { ok: planRes.ok, content: planRes.message };
+                }
+                // 4. 路由 skill_read 工具
+                if (name === 'skill_read') {
+                    const res = skillManager.readSkillContent(typeof args['name'] === 'string' ? args['name'] : undefined);
+                    return { ok: res.ok, content: res.content };
+                }
+                // 5. 路由 ask_user_question 工具
+                if (name === 'ask_user_question') {
+                    const q = String(args['question'] ?? '');
+                    const opts = Array.isArray(args['options']) ? args['options'] : [];
+                    return permissionGate.askUser(this.conn, sessionId, callId, q, opts, signal);
+                }
+                // 6. 路由 file_read（优先尝试编辑器未保存缓冲区，带超时降级保护）
+                if (name === 'file_read') {
+                    const rawPath = String(args['path'] ?? args['file'] ?? args['filePath'] ?? '');
+                    if (this.clientFsDelegate.isEnabled && rawPath) {
+                        try {
+                            const delegated = await this.clientFsDelegate.readTextFile(this.conn, sessionId, rawPath, signal);
+                            return { ok: true, content: delegated.content };
+                        }
+                        catch {
+                            // 超时或失败时平滑降级至本地磁盘
+                        }
+                    }
+                }
+                // 7. 本地基础工具 (file_read, file_write, file_list, file_search, shell_run)
+                return baseExecutor.execute(name, args, signal);
+            },
+        };
+        return { workspaceRoot, policy, tools, executor };
+    }
+    // -------------------------------------------------------------------------
+    // 对话轮次执行与多轮工具循环
     // -------------------------------------------------------------------------
     async runTurn(session, userText, attachments) {
-        // Tools are advertised in the prompt and driven by this loop. One extra
-        // gateway turn per tool call is the price of needing nothing but the
-        // gateway; the native MCP alternative lives on the `mcp-native` branch.
-        //
-        // The tool set and its jail come from THIS session's cwd, not from a global:
-        // two conversations on two folders must not see each other's files.
         const st = session.sessionTools;
-        const result = await runWithInjectedTools({
-            userText,
-            tools: st.tools,
-            workspaceRoot: st.workspaceRoot,
-            executor: st.executor,
-            maxToolRounds: Number.parseInt(process.env.QUICK_ACP_MAX_TOOL_ROUNDS ?? '12', 10) || 12,
-            turn: (text) => this.oneGatewayTurn(session, text, []),
-            onAssistantText: () => {
-                /* streamed to the client already */
-            },
-            onToolCall: (call, result) => {
-                void this.emitToolUpdate(session, call.name, call.arguments, result.content, result.ok);
-            },
-        });
-        return { cancelled: result.cancelled, text: result.finalText };
+        let firstTurn = true;
+        let lastUsage = null;
+        let hasSideEffects = false;
+        let hasOutputEmitted = false;
+        let accumulatedThought = '';
+        const executedToolCalls = [];
+        try {
+            const result = await runWithInjectedTools({
+                userText,
+                tools: st.tools,
+                workspaceRoot: st.workspaceRoot,
+                executor: st.executor,
+                maxToolRounds: Number.parseInt(process.env.QUICK_ACP_MAX_TOOL_ROUNDS ?? '12', 10) || 12,
+                abortSignal: session.abortController?.signal,
+                turn: (text) => {
+                    const images = firstTurn ? attachments : [];
+                    firstTurn = false;
+                    return runWithClassifiedRetry(async () => {
+                        let res = await this.oneGatewayTurn(session, text, images, (delta) => {
+                            hasOutputEmitted = true;
+                        }, (thoughtDelta) => {
+                            accumulatedThought += thoughtDelta;
+                        });
+                        // 评估是否安全通过修正提示继续（不自动重放有未知副作用的原生调用）
+                        let nativeRetries = 0;
+                        const maxNativeRetries = 1;
+                        while (res.interceptedNativeTool && nativeRetries < maxNativeRetries) {
+                            if (session.cancelled || session.abortController?.signal?.aborted) {
+                                return { text: res.text, cancelled: true };
+                            }
+                            nativeRetries++;
+                            const intercepted = res.interceptedNativeTool;
+                            void this.emitThought(session.id, `（已拦截上游原生设备工具 ${intercepted.toolName}，云端环境无法访问本地工作区，正在提示模型切换为本机 quick-tool-call）`);
+                            const correctivePrompt = `【系统提示：上游原生设备工具 '${intercepted.toolName}' 已被拦截并终止。` +
+                                `云端设备环境无法访问本地工作区 (${session.cwd})。` +
+                                `本机没有任何外部设备。请严格使用 \`\`\`quick-tool-call 格式调用本地工具（如 file_read, file_write, file_list, shell_run 等）操作项目目录！` +
+                                `禁止使用任何原生设备工具。请现在通过 \`\`\`quick-tool-call 重新发起操作。】`;
+                            res = await this.oneGatewayTurn(session, correctivePrompt, [], (delta) => {
+                                hasOutputEmitted = true;
+                            }, (thoughtDelta) => {
+                                accumulatedThought += thoughtDelta;
+                            });
+                        }
+                        if (res.interceptedNativeTool) {
+                            const errMsg = `错误：模型持续尝试调用云端原生设备工具 (${res.interceptedNativeTool.toolName})，云端无法访问本地工作区。已终止执行以保护安全。`;
+                            throw new RequestError(-32603, errMsg);
+                        }
+                        lastUsage = res.usage ?? null;
+                        return { text: res.text, cancelled: res.cancelled };
+                    }, {
+                        hasSideEffects,
+                        hasOutputEmitted: () => hasOutputEmitted,
+                        abortSignal: session.abortController?.signal,
+                        onNotice: (notice) => {
+                            void this.emitThought(session.id, notice);
+                        },
+                    });
+                },
+                onAssistantText: () => { },
+                onBudgetExhausted: async ({ notice }) => {
+                    await this.emitText(session.id, notice);
+                },
+                onToolStart: (call, id) => {
+                    executedToolCalls.push({
+                        toolCallId: id,
+                        toolName: call.name,
+                        args: call.arguments,
+                    });
+                    void this.emitToolStart(session, call.name, call.arguments, id);
+                },
+                onToolEnd: (call, id, toolRes) => {
+                    // 标记副作用：文件写、命令运行或任意 MCP 工具执行均不可重新回放
+                    if (call.name === 'file_write' ||
+                        call.name === 'shell_run' ||
+                        call.name.startsWith('mcp__')) {
+                        hasSideEffects = true;
+                    }
+                    const found = executedToolCalls.find((t) => t.toolCallId === id);
+                    if (found) {
+                        found.result = toolRes.content;
+                        found.ok = toolRes.ok;
+                    }
+                    void this.emitToolResult(session, call.name, call.arguments, toolRes.content, toolRes.ok, id);
+                },
+                onToolCall: () => { },
+            });
+            // 记录助手轮次至持久化记录
+            if (session.persisted) {
+                session.persisted.turns.push({
+                    role: 'assistant',
+                    text: result.finalText,
+                    thought: accumulatedThought ? accumulatedThought : undefined,
+                    toolCalls: executedToolCalls.length > 0 ? executedToolCalls : undefined,
+                    timestamp: Date.now(),
+                });
+                await saveSession(session.persisted);
+            }
+            return {
+                cancelled: result.cancelled,
+                text: result.finalText,
+                usage: lastUsage,
+                exhausted: result.exhausted,
+                progress: result.progress,
+            };
+        }
+        catch (e) {
+            // 异常审计落盘：即使中途失败，已执行的工具调用及产生的思考也必须持久化，避免丢失证据并防止重复回放
+            if (session.persisted && (executedToolCalls.length > 0 || accumulatedThought)) {
+                try {
+                    const errMsg = e instanceof Error ? e.message : String(e);
+                    session.persisted.turns.push({
+                        role: 'assistant',
+                        text: `[执行异常中止: ${errMsg}]`,
+                        thought: accumulatedThought ? accumulatedThought : undefined,
+                        toolCalls: executedToolCalls.length > 0 ? executedToolCalls : undefined,
+                        timestamp: Date.now(),
+                    });
+                    await saveSession(session.persisted);
+                }
+                catch {
+                    /* 忽略审计落盘自身错误，继续抛出原异常 */
+                }
+            }
+            throw e;
+        }
     }
-    /** One gateway turn: send text, stream deltas as ACP updates, return full text. */
-    async oneGatewayTurn(session, text, attachments) {
+    async oneGatewayTurn(session, text, attachments, onTextChunk, onThoughtChunk) {
         let full = '';
-        // Strips the tool-call contract out of what the user sees. See below.
-        const visible = new ToolCallFilter((delta) => this.emitText(session.id, delta));
+        let turnUsage = null;
+        let interceptedNativeTool;
+        const activeUpstreamCalls = new Map();
+        const visible = new ToolCallFilter(async (delta) => {
+            onTextChunk?.(delta);
+            await this.emitText(session.id, delta);
+        });
         const stream = session.chat.sendTurn([{ role: 'user', text }], {
             agentMode: session.agentMode,
             thinkingEffort: session.thinkingEffort,
             attachments,
+            signal: session.abortController?.signal,
         });
-        for await (const ev of stream) {
-            if (session.cancelled) {
-                session.chat.cancel();
-                return { text: full, cancelled: true };
-            }
-            switch (ev.type) {
-                case 'text':
-                    full += ev.delta;
-                    await visible.push(ev.delta);
+        try {
+            for await (const ev of stream) {
+                if (session.cancelled) {
+                    session.chat.cancel();
+                    return { text: full, cancelled: true, usage: turnUsage };
+                }
+                switch (ev.type) {
+                    case 'text':
+                        full += ev.delta;
+                        await visible.push(ev.delta);
+                        break;
+                    case 'thinking':
+                        onThoughtChunk?.(ev.delta);
+                        await this.emitThought(session.id, ev.delta);
+                        break;
+                    case 'title':
+                        if (session.persisted)
+                            session.persisted.title = ev.title;
+                        break;
+                    case 'usage':
+                    case 'turn_end':
+                        if (ev.usage)
+                            turnUsage = ev.usage;
+                        break;
+                    case 'tool_start': {
+                        if (isNativeDeviceTool(ev.toolName)) {
+                            // 关键修复：检测到上游网关原生设备工具调用（如 run_python_on_device 等），
+                            // 绝对不能只发 pending 卡片永远等待。立即发送 pending 卡片并立即 fail-closed 终止网关执行！
+                            await this.emitToolStart(session, ev.toolName, ev.args, ev.toolId);
+                            session.chat.cancel();
+                            const errDesc = `错误：检测到上游网关原生设备工具调用 (${ev.toolName})。` +
+                                `云端设备环境无法访问本地工作区 (${session.cwd})，已终止该执行路径。` +
+                                `必须改用本机 quick-tool-call 工具。`;
+                            await this.emitToolResult(session, ev.toolName, ev.args, errDesc, false, ev.toolId);
+                            interceptedNativeTool = { toolName: ev.toolName, toolId: ev.toolId, args: ev.args };
+                            break;
+                        }
+                        activeUpstreamCalls.set(ev.toolId, { toolName: ev.toolName, args: ev.args });
+                        await this.emitToolStart(session, ev.toolName, ev.args, ev.toolId);
+                        break;
+                    }
+                    case 'tool_end': {
+                        const info = activeUpstreamCalls.get(ev.toolId);
+                        const toolName = info?.toolName ?? 'gateway_tool';
+                        const args = info?.args ?? null;
+                        const ok = !ev.error;
+                        const resultStr = ev.error
+                            ? `Error: ${ev.error}`
+                            : typeof ev.result === 'string'
+                                ? ev.result
+                                : JSON.stringify(ev.result ?? '');
+                        await this.emitToolResult(session, toolName, args, resultStr, ok, ev.toolId);
+                        activeUpstreamCalls.delete(ev.toolId);
+                        break;
+                    }
+                    case 'error':
+                        if (ev.code === 'cancelled') {
+                            return { text: full, cancelled: true, usage: turnUsage, interceptedNativeTool };
+                        }
+                        throw new Error(`${ev.code}: ${ev.message}`);
+                    default:
+                        break;
+                }
+                if (interceptedNativeTool) {
+                    // 已拦截并终止原生设备调用，退出流处理
                     break;
-                case 'thinking':
-                    // ACP has agent_thought_chunk for exactly this; forward it so the
-                    // client can render reasoning like it does for any other agent.
-                    await this.emitThought(session.id, ev.delta);
-                    break;
-                case 'tool_start':
-                    await this.emitToolUpdate(session, ev.toolName, ev.args, undefined, true, ev.toolId);
-                    break;
-                case 'tool_end':
-                    break;
-                case 'turn_end':
-                    break;
-                case 'error':
-                    throw new Error(`${ev.code}: ${ev.message}`);
-                default:
-                    break;
+                }
             }
         }
-        await visible.flush();
-        return { text: full, cancelled: session.cancelled };
+        finally {
+            // 保证所有已开始的网关工具卡片在轮次结束时都被正确闭合，绝不留 pending 卡片
+            for (const [toolId, info] of activeUpstreamCalls.entries()) {
+                await this.emitToolResult(session, info.toolName, info.args, '网关工具执行中断或轮次已结束', false, toolId);
+            }
+            activeUpstreamCalls.clear();
+            await visible.flush();
+        }
+        return { text: full, cancelled: session.cancelled, usage: turnUsage, interceptedNativeTool };
     }
     // -------------------------------------------------------------------------
-    // ACP notifications
+    // ACP 通知推送
     // -------------------------------------------------------------------------
     async emitText(sessionId, delta) {
         if (!this.conn || !delta)
@@ -364,17 +1002,8 @@ export class QuickAcpAgent {
         try {
             await this.conn.sessionUpdate(notification);
         }
-        catch {
-            /* client went away */
-        }
+        catch { }
     }
-    /**
-     * Forward reasoning to the client.
-     *
-     * ACP distinguishes agent_thought_chunk from agent_message_chunk precisely so
-     * a client can render thinking separately instead of mistaking it for the
-     * answer. Quick emits thinking_delta, so it maps straight across.
-     */
     async emitThought(sessionId, delta) {
         if (!this.conn || !delta)
             return;
@@ -388,63 +1017,97 @@ export class QuickAcpAgent {
         try {
             await this.conn.sessionUpdate(notification);
         }
-        catch {
-            /* client went away */
-        }
+        catch { }
     }
-    /**
-     * Announce a tool call to the client, then its outcome.
-     *
-     * TWO PROTOCOL MISTAKES THIS FIXES (both were visible in codeg as "the tool
-     * call JSON is printed as chat text instead of a tool card"):
-     *
-     * 1. The content block was `{ type: 'content', content: { text } }` — the
-     *    inner object must be a real text block, `{ type: 'text', text }`. Without
-     *    that discriminator a strict client drops the content as unrenderable.
-     *
-     * 2. The result was sent as a second `tool_call` with the same id. ACP models
-     *    this as `tool_call` (create) then `tool_call_update` (progress/result);
-     *    re-sending `tool_call` is undefined and clients ignore it.
-     *
-     * `kind` also matters: it is how a client decides which icon and affordance to
-     * show, and 'other' for everything made every call look identical.
-     */
-    async emitToolUpdate(session, toolName, args, resultText, ok, toolCallId) {
+    async emitUserMessage(sessionId, text) {
+        if (!this.conn || !text)
+            return;
+        const notification = {
+            sessionId,
+            update: {
+                sessionUpdate: 'user_message_chunk',
+                content: { type: 'text', text },
+            },
+        };
+        try {
+            await this.conn.sessionUpdate(notification);
+        }
+        catch { }
+    }
+    async emitPlan(sessionId, entries) {
         if (!this.conn)
             return;
-        const id = toolCallId ?? `tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        // Creation frame. No content yet: the call has not produced anything.
+        const notification = {
+            sessionId,
+            update: {
+                sessionUpdate: 'plan',
+                entries,
+            },
+        };
+        try {
+            await this.conn.sessionUpdate(notification);
+        }
+        catch { }
+    }
+    async emitAvailableCommands(sessionId, availableCommands) {
+        if (!this.conn)
+            return;
+        const notification = {
+            sessionId,
+            update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands,
+            },
+        };
+        try {
+            await this.conn.sessionUpdate(notification);
+        }
+        catch { }
+    }
+    async emitModeUpdate(sessionId, currentModeId) {
+        if (!this.conn)
+            return;
+        const notification = {
+            sessionId,
+            update: {
+                sessionUpdate: 'current_mode_update',
+                currentModeId,
+            },
+        };
+        try {
+            await this.conn.sessionUpdate(notification);
+        }
+        catch { }
+    }
+    async emitToolStart(session, toolName, args, toolCallId) {
+        if (!this.conn)
+            return;
         const created = {
             sessionId: session.id,
             update: {
                 sessionUpdate: 'tool_call',
-                toolCallId: id,
+                toolCallId,
                 title: toolTitle(toolName, args),
                 kind: toolKind(toolName),
                 status: 'pending',
                 rawInput: asRawInput(args),
-                // Which file this call touches. ACP clients use it to attach the call to
-                // a path and show a diff / "open file" affordance; without it a client
-                // that wants to enrich the card has nothing to resolve.
                 ...(toolLocations(args).length > 0 ? { locations: toolLocations(args) } : {}),
             },
         };
         try {
             await this.conn.sessionUpdate(created);
         }
-        catch {
-            return; // client went away; nothing to update either
-        }
-        if (resultText === undefined)
+        catch { }
+    }
+    async emitToolResult(session, toolName, args, resultText, ok, toolCallId) {
+        if (!this.conn || resultText === undefined)
             return;
-        // Result frame. `diff` content for a write, so the client can render the
-        // change instead of a bare string.
         const diff = buildDiffContent(toolName, args, ok);
         const updated = {
             sessionId: session.id,
             update: {
                 sessionUpdate: 'tool_call_update',
-                toolCallId: id,
+                toolCallId,
                 status: ok ? 'completed' : 'failed',
                 content: diff
                     ? [diff]
@@ -460,11 +1123,8 @@ export class QuickAcpAgent {
         try {
             await this.conn.sessionUpdate(updated);
         }
-        catch {
-            /* client went away */
-        }
+        catch { }
     }
-    // -------------------------------------------------------------------------
     requireSession(id) {
         const s = this.sessions.get(id);
         if (!s)
@@ -478,12 +1138,6 @@ export class QuickAcpAgent {
         return this.quickSession;
     }
 }
-/**
- * Map our tool names onto ACP's ToolKind.
- *
- * The client renders per kind (a read shows a file, an execute shows a
- * terminal). Reporting 'other' for everything is why every call looked the same.
- */
 function toolKind(toolName) {
     switch (toolName) {
         case 'file_read':
@@ -492,6 +1146,7 @@ function toolKind(toolName) {
             return 'edit';
         case 'file_list':
         case 'file_search':
+        case 'skill_read':
             return 'search';
         case 'shell_run':
             return 'execute';
@@ -499,40 +1154,37 @@ function toolKind(toolName) {
             return 'other';
     }
 }
-/** A one-line human summary. The client shows this as the card's heading. */
 function toolTitle(toolName, args) {
     const a = (args && typeof args === 'object' ? args : {});
     const str = (k) => (typeof a[k] === 'string' ? a[k] : '');
     const quoted = (v) => (v.length > 72 ? `${v.slice(0, 69)}...` : v);
     switch (toolName) {
         case 'shell_run':
-            return `Run ${quoted(str('command') || 'command')}`;
+            return `执行命令: ${quoted(str('command') || str('cmd') || 'command')}`;
         case 'file_read':
-            return `Read ${quoted(str('path') || 'file')}`;
+            return `读取文件: ${quoted(str('path') || str('file') || str('filePath') || 'file')}`;
         case 'file_write':
-            return `Write ${quoted(str('path') || 'file')}`;
+            return `修改文件: ${quoted(str('path') || str('file') || str('filePath') || 'file')}`;
         case 'file_list':
-            return `List ${quoted(str('path') || '.')}`;
+            return `列出目录: ${quoted(str('path') || str('dir') || str('directory') || '.')}`;
         case 'file_search':
-            return `Search ${quoted(str('pattern') || '')}`;
+            return `检索内容: ${quoted(str('pattern') || str('query') || str('regex') || '')}`;
+        case 'plan_update':
+            return '更新任务执行计划';
+        case 'skill_read':
+            return `查阅技能: ${quoted(str('name') || '所有技能')}`;
+        case 'ask_user_question':
+            return `向用户提问: ${quoted(str('question') || '问题')}`;
         default:
             return toolName;
     }
 }
-/** ACP wants rawInput as an object; a stray string would be dropped. */
 function asRawInput(args) {
     if (args && typeof args === 'object' && !Array.isArray(args)) {
         return args;
     }
     return { value: args };
 }
-/**
- * Files this call touches, for ACP's `locations`.
- *
- * A client that wants to enrich a tool card — "this wrote src/app.ts" — has to
- * learn the path from somewhere, and `rawInput` is an opaque blob by contract.
- * `locations` is the field meant for it.
- */
 function toolLocations(args) {
     const a = (args && typeof args === 'object' ? args : {});
     const out = [];
@@ -540,67 +1192,50 @@ function toolLocations(args) {
         out.push({ path: a['path'] });
     if (typeof a['file'] === 'string' && a['file'])
         out.push({ path: a['file'] });
+    if (typeof a['filePath'] === 'string' && a['filePath'])
+        out.push({ path: a['filePath'] });
     return out;
 }
-/**
- * A `diff` content block for a write, so the client shows the change.
- *
- * ACP has three content shapes: text, diff, terminal. Reporting a write as a
- * text blob ("wrote 412 bytes") throws away the two strings a client needs to
- * render side-by-side, so writes get a real diff instead.
- *
- * `oldText` is omitted for a new file — the schema says null means "did not
- * exist", which is exactly right here because we do not read the previous
- * contents (nothing in the tool result carries them).
- */
 function buildDiffContent(toolName, args, ok) {
-    if (!ok)
-        return null;
-    if (toolName !== 'file_write')
+    if (toolName !== 'file_write' || !ok)
         return null;
     const a = (args && typeof args === 'object' ? args : {});
-    const path = typeof a['path'] === 'string' ? a['path'] : '';
-    const newText = typeof a['content'] === 'string' ? a['content'] : '';
+    const path = typeof a['path'] === 'string' ? a['path'] : typeof a['file'] === 'string' ? a['file'] : '';
+    const content = typeof a['content'] === 'string' ? a['content'] : typeof a['text'] === 'string' ? a['text'] : '';
     if (!path)
         return null;
-    return { type: 'diff', path, newText };
+    return {
+        type: 'diff',
+        path,
+        oldText: null,
+        newText: content,
+    };
 }
-/** Flatten ACP prompt content blocks into text + attachments. */ function extractContent(blocks) {
-    const parts = [];
+function extractContent(prompt) {
+    const texts = [];
     const attachments = [];
-    if (!Array.isArray(blocks))
-        return { text: '', attachments };
-    for (const block of blocks) {
+    for (const block of prompt) {
         if (!block || typeof block !== 'object')
             continue;
         const b = block;
         const type = b['type'];
         if (type === 'text' && typeof b['text'] === 'string') {
-            parts.push(b['text']);
-            continue;
+            texts.push(b['text']);
         }
-        if (type === 'resource' && typeof b['resource'] === 'object') {
-            const r = b['resource'];
-            if (typeof r['text'] === 'string')
-                parts.push(r['text']);
-            continue;
-        }
-        // ACP image blocks carry base64 in `data` with `mimeType`; that maps
-        // straight onto Quick's attachment shape.
-        if (type === 'image' && typeof b['data'] === 'string') {
-            const mimeType = typeof b['mimeType'] === 'string' ? b['mimeType'] : 'image/png';
-            const ext = mimeType.split('/')[1] ?? 'png';
-            const data = b['data'];
-            attachments.push({
-                type: 'image',
-                name: `image_${attachments.length + 1}.${ext}`,
-                size: Math.floor((data.length * 3) / 4), // base64 -> bytes, approximate
-                mimeType,
-                data,
-            });
-            continue;
+        else if (type === 'image') {
+            const data = typeof b['data'] === 'string' ? b['data'] : '';
+            const mime = typeof b['mimeType'] === 'string' ? b['mimeType'] : 'image/png';
+            if (data) {
+                attachments.push({
+                    type: 'image',
+                    name: 'image.png',
+                    size: Math.floor((data.length * 3) / 4),
+                    mimeType: mime,
+                    data,
+                });
+            }
         }
     }
-    return { text: parts.join('\n\n'), attachments };
+    return { text: texts.join('\n\n'), attachments };
 }
 //# sourceMappingURL=agent.js.map

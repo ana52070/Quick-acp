@@ -1,19 +1,33 @@
-﻿{
+{
   "name": "quick-acp",
-  "version": "0.1.4",
+  "version": "0.1.8",
   "type": "module",
   "description": "ACP agent that bridges AWS Quick (Quickwork) Claude quota to standard ACP clients",
   "license": "MIT",
+  "author": "quick-acp contributors",
+  "homepage": "https://github.com/ana52070/Quick-acp#readme",
+  "bugs": {
+    "url": "https://github.com/ana52070/Quick-acp/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ana52070/Quick-acp.git"
+  },
+  "funding": {
+    "type": "individual",
+    "url": "https://github.com/ana52070"
   },
   "keywords": [
     "acp",
     "agent-client-protocol",
     "quick",
     "quickwork",
-    "claude"
+    "claude",
+    "codeg",
+    "t3-code",
+    "zed",
+    "agent",
+    "cli"
   ],
   "bin": {
     "quick-acp": "dist/main.js",
@@ -22,7 +36,24 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "README.zh-CN.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "SECURITY.md",
+    "LICENSE",
+    "NOTICE",
+    "docs",
+    "examples/snake",
+    "scripts/regression.mjs",
+    "scripts/acp-acceptance.mjs",
+    "scripts/test-capabilities.mjs",
+    "scripts/acp-offline-integration.mjs",
+    "scripts/test-device-routing.mjs",
+    "scripts/test-auth-rootcause-fixes.mjs",
+    "scripts/test-tool-budget.mjs",
+    "scripts/test-tool-budget-boundaries.mjs",
+    "scripts/t3-acp-compat.mjs",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=22"
@@ -31,6 +62,13 @@
     "build": "tsc -p tsconfig.json",
     "dev": "node --experimental-strip-types src/main.ts",
     "start": "node dist/main.js",
+    "test": "npm run build && npm run probe && npm run smoke && npm run test:regression && npm run test:integration && npm run test:rootcause && npm run test:budget",
+    "test:regression": "node scripts/regression.mjs",
+    "test:integration": "node scripts/acp-offline-integration.mjs",
+    "test:rootcause": "node scripts/test-auth-rootcause-fixes.mjs",
+    "test:budget": "node scripts/test-tool-budget.mjs && node scripts/test-tool-budget-boundaries.mjs",
+    "test:live": "node scripts/acp-acceptance.mjs",
+    "test:acceptance": "node scripts/acp-acceptance.mjs",
     "login": "node dist/login-cli.js",
     "probe": "node dist/probe.js",
     "smoke": "node dist/acp-smoke.js",
@@ -40,10 +78,11 @@
     "test:tools": "node dist/inject-turn-test.js",
     "test:concurrent": "node dist/concurrent-test.js",
     "doctor": "node dist/doctor.js",
-    "verify": "npm run build && npm run probe && npm run smoke",
+    "verify": "npm run build && npm run probe && npm run smoke && npm run test:regression && npm run test:integration && npm run test:rootcause && npm run test:budget",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@zed-industries/agent-client-protocol": "^0.4.5",
     "ws": "^8.18.0"
   },

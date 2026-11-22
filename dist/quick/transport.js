@@ -43,7 +43,8 @@ const CONNECT_TIMEOUT_MS = 30_000;
  */
 export function buildHandshake(session, opts = {}) {
     const path = opts.path ?? session.wsPath ?? WORKING_PATH;
-    const url = new URL(`wss://${session.wsHost}${path}`);
+    const scheme = session.wsHost.startsWith('127.0.0.1') || session.wsHost.startsWith('localhost') ? 'ws' : 'wss';
+    const url = new URL(`${scheme}://${session.wsHost}${path}`);
     const auth = opts.auth ?? (process.env.QUICK_ACP_AUTH_IN_HEADER === '1' ? 'header' : 'query');
     // surfaceType is required by the server; without it the upgrade is refused.
     url.searchParams.set('surfaceType', session.surface);
@@ -92,6 +93,7 @@ export class QuickTransport {
     sawInbound = false;
     lastInboundAt = Date.now();
     closedByUs = false;
+    closeEmitted = false;
     framing;
     debug;
     constructor(session, opts = {}) {
@@ -114,6 +116,13 @@ export class QuickTransport {
             }
         }
     }
+    emitClose(code, reason) {
+        if (this.closeEmitted)
+            return;
+        this.closeEmitted = true;
+        this.stopWatchdogs();
+        this.emit({ type: 'close', code, reason });
+    }
     log(...args) {
         if (this.debug)
             console.error('[quick-acp:ws]', ...args);
@@ -125,6 +134,10 @@ export class QuickTransport {
             : this.session;
         const { url, headers } = buildHandshake(session, { framing: this.framing });
         this.log('connecting to', url.replace(/(token=)[^&]*/, '$1<redacted>'));
+        this.closeEmitted = false;
+        this.closedByUs = false;
+        this.pendingPong = false;
+        this.missedPongs = 0;
         await new Promise((resolve, reject) => {
             const ws = new WebSocket(url, { headers });
             this.ws = ws;
@@ -155,6 +168,9 @@ export class QuickTransport {
             ws.on('message', (data) => {
                 this.lastInboundAt = Date.now();
                 this.sawInbound = true;
+                // 应用层入站消息证实链路存活，清除 pong 等待与错失计数
+                this.pendingPong = false;
+                this.missedPongs = 0;
                 try {
                     this.handleBinary(toUint8(data));
                 }
@@ -178,7 +194,6 @@ export class QuickTransport {
             });
             ws.on('close', (code, reason) => {
                 clearTimeout(timeout);
-                this.stopWatchdogs();
                 const text = reason?.toString() ?? '';
                 this.log('close', code, text);
                 if (!settled) {
@@ -186,8 +201,11 @@ export class QuickTransport {
                     reject(new Error(`closed before open (code ${code}) ${text}`.trim()));
                     return;
                 }
-                if (!this.closedByUs)
-                    this.emit({ type: 'close', code, reason: text });
+                // 旧连接的迟到 close 不得清理已重建连接的定时器或结束新轮次。
+                if (this.ws !== ws)
+                    return;
+                this.stopWatchdogs();
+                this.emitClose(code, text);
             });
         });
     }
@@ -237,7 +255,13 @@ export class QuickTransport {
         this.pingTimer = setInterval(() => {
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
                 return;
-            if (this.pendingPong) {
+            // 若在当前检测周期内有应用层入站，证明连接存活，不当作超时
+            const recentInbound = Date.now() - this.lastInboundAt < WS_PING_INTERVAL_MS;
+            if (recentInbound) {
+                this.pendingPong = false;
+                this.missedPongs = 0;
+            }
+            else if (this.pendingPong) {
                 this.missedPongs++;
                 if (this.missedPongs >= WS_PING_MAX_MISSED) {
                     this.log('ping timeout; terminating');
@@ -306,15 +330,21 @@ export class QuickTransport {
         this.refreshTimer = null;
     }
     terminate(code = 1000, reason = 'client_close') {
-        this.closedByUs = true;
+        const isNormalUserClose = code === 1000 && reason === 'client_close';
+        this.closedByUs = isNormalUserClose;
         this.stopWatchdogs();
+        const currentWs = this.ws;
+        this.ws = null;
         try {
-            this.ws?.close(code, reason);
+            currentWs?.close(code, reason);
         }
         catch {
             /* already closing */
         }
-        this.ws = null;
+        // 非正常主动退出（例如看门狗 4002 ping_timeout 或 4003 inbound_idle），主动确保 emitClose
+        if (!isNormalUserClose) {
+            this.emitClose(code, reason);
+        }
     }
     get isOpen() {
         return this.ws?.readyState === WebSocket.OPEN;

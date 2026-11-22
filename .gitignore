@@ -1,6 +1,21 @@
 node_modules/
 *.log
 
+# Python bytecode from the snake example
+__pycache__/
+*.py[cod]
+
+# Local working area: acceptance evidence, release tarballs, client
+# transcripts, and scratch copies of node_modules. Never shipped, and it
+# contains user paths and conversation content that must not be published.
+.dispatch/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
 # dist/ IS committed on purpose.
 #
 # codeg launches agents from a distribution spec, and the JS channel for that is

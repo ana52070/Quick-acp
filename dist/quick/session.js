@@ -39,6 +39,7 @@ export class QuickChatSession {
     opts;
     state = null;
     connected = false;
+    transportUnsub = null;
     activeMessageId = null;
     activeHandler = null;
     debug;
@@ -52,14 +53,22 @@ export class QuickChatSession {
     }
     /** Open the gateway and perform session_connect. */
     async open() {
-        if (this.connected)
+        if (this.connected && this.opts.transport.isOpen)
             return;
-        this.opts.transport.on((ev) => {
+        if (this.transportUnsub) {
+            this.transportUnsub();
+            this.transportUnsub = null;
+        }
+        this.transportUnsub = this.opts.transport.on((ev) => {
             if (ev.type === 'message')
                 this.handleBody(ev.body);
-            else if (ev.type === 'error')
+            else if (ev.type === 'error') {
+                if (!this.opts.transport.isOpen)
+                    this.connected = false;
                 this.failActive('transport_error', ev.body);
+            }
             else if (ev.type === 'close') {
+                this.connected = false;
                 this.failActive('transport_closed', `closed ${ev.code} ${ev.reason}`);
             }
         });
@@ -89,9 +98,11 @@ export class QuickChatSession {
      * a conversation the moment the session is created, and an id that only
      * appears after the first message is no id at all.
      */
-    ensureThread() {
+    ensureThread(existingThreadId) {
         if (!this.state)
-            this.state = { threadId: randomUUID(), sentTurns: [] };
+            this.state = { threadId: existingThreadId ?? randomUUID(), sentTurns: [] };
+        else if (existingThreadId)
+            this.state.threadId = existingThreadId;
         return this.state.threadId;
     }
     /** Forget the thread, so the next turn starts a fresh conversation. */
@@ -130,31 +141,51 @@ export class QuickChatSession {
         };
         const mode = opts.agentMode ?? this.opts.agentMode ?? 'smart';
         const effort = clampEffort(opts.thinkingEffort ?? this.opts.thinkingEffort ?? 'high');
-        this.opts.transport.send({
-            type: 'user_message',
-            payload: {
-                thread_id: this.state.threadId,
-                text: lastUser.text,
-                message_id: messageId,
-                // The server checks these; the app's tf() supplies them on every frame.
-                surfaceType: this.opts.transport.surface,
-                outpostId: this.opts.transport.outpostId,
-                agent_mode: mode === 'advanced' ? 'smart' : mode,
-                thinking_effort: effort,
-                send_origin: 'composer',
-                had_physical_input: true,
-                traceId: randomUUID(),
-                user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC',
-                user_locale: 'en-US',
-                auto_routing: false,
-                web_search_enabled: false,
-                direct_chat: false,
-                ...(opts.attachments && opts.attachments.length > 0
-                    ? { attachments: opts.attachments }
-                    : {}),
-            },
-        });
+        const defaultTurnTimeout = Number.parseInt(process.env.QUICK_ACP_TURN_TIMEOUT_MS ?? '180000', 10) || 180000;
+        const timeoutMs = opts.turnTimeoutMs ?? this.opts.turnTimeoutMs ?? defaultTurnTimeout;
+        let timeoutTimer = null;
+        if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+            timeoutTimer = setTimeout(() => {
+                this.cancel('turn_timeout', `Gateway turn timed out after ${timeoutMs}ms`);
+            }, timeoutMs);
+        }
+        const onAbort = () => {
+            this.cancel();
+        };
+        if (opts.signal) {
+            if (opts.signal.aborted) {
+                onAbort();
+            }
+            else {
+                opts.signal.addEventListener('abort', onAbort, { once: true });
+            }
+        }
         try {
+            if (!finished)
+                this.opts.transport.send({
+                    type: 'user_message',
+                    payload: {
+                        thread_id: this.state.threadId,
+                        text: lastUser.text,
+                        message_id: messageId,
+                        // The server checks these; the app's tf() supplies them on every frame.
+                        surfaceType: this.opts.transport.surface,
+                        outpostId: this.opts.transport.outpostId,
+                        agent_mode: mode === 'advanced' ? 'smart' : mode,
+                        thinking_effort: effort,
+                        send_origin: 'composer',
+                        had_physical_input: true,
+                        traceId: randomUUID(),
+                        user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC',
+                        user_locale: 'en-US',
+                        auto_routing: false,
+                        web_search_enabled: false,
+                        direct_chat: false,
+                        ...(opts.attachments && opts.attachments.length > 0
+                            ? { attachments: opts.attachments }
+                            : {}),
+                    },
+                });
             while (!finished) {
                 if (queue.length === 0) {
                     await new Promise((resolve) => {
@@ -171,6 +202,10 @@ export class QuickChatSession {
                 yield queue.shift();
         }
         finally {
+            if (timeoutTimer)
+                clearTimeout(timeoutTimer);
+            if (opts.signal)
+                opts.signal.removeEventListener('abort', onAbort);
             this.activeHandler = null;
             this.activeMessageId = null;
             const reply = this.lastText;
@@ -184,7 +219,7 @@ export class QuickChatSession {
     /** Usage seen for the turn in flight; attached when `message_complete` lands. */
     pendingUsage = null;
     /** Ask the server to stop the in-flight turn. */
-    cancel() {
+    cancel(code = 'cancelled', message = 'Turn was cancelled') {
         if (!this.state)
             return;
         try {
@@ -200,8 +235,14 @@ export class QuickChatSession {
         catch (e) {
             this.log('cancel failed', e);
         }
+        // Wake up any waiting sendTurn loop immediately
+        this.failActive(code, message);
     }
     close() {
+        if (this.transportUnsub) {
+            this.transportUnsub();
+            this.transportUnsub = null;
+        }
         this.opts.transport.terminate();
         this.connected = false;
     }

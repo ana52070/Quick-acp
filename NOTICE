@@ -1,0 +1,24 @@
+# NOTICE
+
+quick-acp 采用 MIT 许可证（见 [LICENSE](LICENSE)）。
+
+本项目在运行时依赖以下第三方包。它们不作为本项目源代码的一部分分发，但通过 npm 安装时会一并安装，其许可证条款同样适用于它们。
+
+| 依赖 | 许可证 | 说明 |
+| --- | --- | --- |
+| [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) | MIT | Model Context Protocol 官方 SDK，用于会话级 MCP 挂载（stdio / Streamable HTTP / SSE） |
+| [`@zed-industries/agent-client-protocol`](https://github.com/zed-industries/agent-client-protocol) | Apache-2.0 | Agent Client Protocol 官方 SDK，用于 ACP JSON-RPC 通信 |
+| [`ws`](https://github.com/websockets/ws) | MIT | WebSocket 客户端，用于与 Quick 网关的双向流 |
+
+## Apache-2.0 相关说明
+
+`@zed-industries/agent-client-protocol` 以 Apache License 2.0 授权。若你需要复制、修改或再分发该包的代码（而非仅通过 npm 依赖使用），请遵守 Apache-2.0 的条款，包括保留其许可证与 NOTICE 文件。
+
+该包的完整许可证文本随其 npm 包分发，位于 `node_modules/@zed-industries/agent-client-protocol/` 目录下。
+
+## 开发依赖
+
+以下包仅在构建与测试时使用，不进入发布产物，也不影响最终用户的许可证义务：
+
+- `typescript`（Apache-2.0）
+- `@types/node`、`@types/ws`（MIT）

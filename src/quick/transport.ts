@@ -69,7 +69,8 @@ export function buildHandshake(
   } = {},
 ): HandshakeUrl {
   const path = opts.path ?? session.wsPath ?? WORKING_PATH;
-  const url = new URL(`wss://${session.wsHost}${path}`);
+  const scheme = session.wsHost.startsWith('127.0.0.1') || session.wsHost.startsWith('localhost') ? 'ws' : 'wss';
+  const url = new URL(`${scheme}://${session.wsHost}${path}`);
   const auth = opts.auth ?? (process.env.QUICK_ACP_AUTH_IN_HEADER === '1' ? 'header' : 'query');
 
   // surfaceType is required by the server; without it the upgrade is refused.
@@ -136,6 +137,7 @@ export class QuickTransport {
   private sawInbound = false;
   private lastInboundAt = Date.now();
   private closedByUs = false;
+  private closeEmitted = false;
   private readonly framing: FramingMode;
   private readonly debug: boolean;
 
@@ -162,6 +164,13 @@ export class QuickTransport {
     }
   }
 
+  private emitClose(code: number, reason: string): void {
+    if (this.closeEmitted) return;
+    this.closeEmitted = true;
+    this.stopWatchdogs();
+    this.emit({ type: 'close', code, reason });
+  }
+
   private log(...args: unknown[]): void {
     if (this.debug) console.error('[quick-acp:ws]', ...args);
   }
@@ -174,6 +183,11 @@ export class QuickTransport {
     const { url, headers } = buildHandshake(session, { framing: this.framing });
 
     this.log('connecting to', url.replace(/(token=)[^&]*/, '$1<redacted>'));
+
+    this.closeEmitted = false;
+    this.closedByUs = false;
+    this.pendingPong = false;
+    this.missedPongs = 0;
 
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url, { headers });
@@ -204,6 +218,9 @@ export class QuickTransport {
       ws.on('message', (data: WebSocket.RawData) => {
         this.lastInboundAt = Date.now();
         this.sawInbound = true;
+        // 应用层入站消息证实链路存活，清除 pong 等待与错失计数
+        this.pendingPong = false;
+        this.missedPongs = 0;
         try {
           this.handleBinary(toUint8(data));
         } catch (e) {
@@ -229,7 +246,6 @@ export class QuickTransport {
 
       ws.on('close', (code: number, reason: Buffer) => {
         clearTimeout(timeout);
-        this.stopWatchdogs();
         const text = reason?.toString() ?? '';
         this.log('close', code, text);
         if (!settled) {
@@ -237,7 +253,10 @@ export class QuickTransport {
           reject(new Error(`closed before open (code ${code}) ${text}`.trim()));
           return;
         }
-        if (!this.closedByUs) this.emit({ type: 'close', code, reason: text });
+        // 旧连接的迟到 close 不得清理已重建连接的定时器或结束新轮次。
+        if (this.ws !== ws) return;
+        this.stopWatchdogs();
+        this.emitClose(code, text);
       });
     });
   }
@@ -290,7 +309,12 @@ export class QuickTransport {
     // WS-level liveness; two missed pongs means the path is dead.
     this.pingTimer = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-      if (this.pendingPong) {
+      // 若在当前检测周期内有应用层入站，证明连接存活，不当作超时
+      const recentInbound = Date.now() - this.lastInboundAt < WS_PING_INTERVAL_MS;
+      if (recentInbound) {
+        this.pendingPong = false;
+        this.missedPongs = 0;
+      } else if (this.pendingPong) {
         this.missedPongs++;
         if (this.missedPongs >= WS_PING_MAX_MISSED) {
           this.log('ping timeout; terminating');
@@ -357,14 +381,20 @@ export class QuickTransport {
   }
 
   terminate(code = 1000, reason = 'client_close'): void {
-    this.closedByUs = true;
+    const isNormalUserClose = code === 1000 && reason === 'client_close';
+    this.closedByUs = isNormalUserClose;
     this.stopWatchdogs();
+    const currentWs = this.ws;
+    this.ws = null;
     try {
-      this.ws?.close(code, reason);
+      currentWs?.close(code, reason);
     } catch {
       /* already closing */
     }
-    this.ws = null;
+    // 非正常主动退出（例如看门狗 4002 ping_timeout 或 4003 inbound_idle），主动确保 emitClose
+    if (!isNormalUserClose) {
+      this.emitClose(code, reason);
+    }
   }
 
   get isOpen(): boolean {
@@ -394,4 +424,3 @@ function toUint8(data: WebSocket.RawData): Uint8Array {
 }
 
 export { DEFAULT_WS_PATH, ALT_WS_PATH };
-

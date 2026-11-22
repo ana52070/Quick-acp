@@ -285,6 +285,21 @@ export async function resolveSession(opts = {}) {
     if (!opts.force && cachedIsFresh(cached)) {
         return cached;
     }
+    if (process.env.QUICK_ACP_MOCK_SESSION === '1') {
+        return {
+            jwt: 'mock-jwt-token',
+            wsHost: process.env.QUICK_ACP_MOCK_HOST || '127.0.0.1:8781',
+            wsPath: process.env.QUICK_ACP_MOCK_PATH || DEFAULT_WS_PATH,
+            tenantUrl: 'http://127.0.0.1',
+            surface: surfaceForPlatform(),
+            outpostId: 'mock-device-id',
+            workingSessionId: randomUUID(),
+            actorArn: 'arn:aws:quick::123456789012:actor/mock',
+            provider: 'mock',
+            source: 'cached',
+            expiresAt: Date.now() + 3600_000,
+        };
+    }
     const failures = [];
     // 1. Straight from the credential store: no outpost, no instance token.
     try {
