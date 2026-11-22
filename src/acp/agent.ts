@@ -517,8 +517,12 @@ export class QuickAcpAgent implements Agent {
         toolCallId: id,
         title: toolTitle(toolName, args),
         kind: toolKind(toolName),
-        status: 'in_progress',
+        status: 'pending',
         rawInput: asRawInput(args),
+        // Which file this call touches. ACP clients use it to attach the call to
+        // a path and show a diff / "open file" affordance; without it a client
+        // that wants to enrich the card has nothing to resolve.
+        ...(toolLocations(args).length > 0 ? { locations: toolLocations(args) } : {}),
       },
     } as unknown as SessionNotification;
     try {
@@ -529,19 +533,23 @@ export class QuickAcpAgent implements Agent {
 
     if (resultText === undefined) return;
 
-    // Result frame.
+    // Result frame. `diff` content for a write, so the client can render the
+    // change instead of a bare string.
+    const diff = buildDiffContent(toolName, args, ok);
     const updated: SessionNotification = {
       sessionId: session.id,
       update: {
         sessionUpdate: 'tool_call_update',
         toolCallId: id,
         status: ok ? 'completed' : 'failed',
-        content: [
-          {
-            type: 'content',
-            content: { type: 'text', text: resultText },
-          },
-        ],
+        content: diff
+          ? [diff]
+          : [
+              {
+                type: 'content',
+                content: { type: 'text', text: resultText },
+              },
+            ],
         rawOutput: { output: resultText, ok },
       },
     } as unknown as SessionNotification;
@@ -617,6 +625,46 @@ function asRawInput(args: unknown): Record<string, unknown> {
     return args as Record<string, unknown>;
   }
   return { value: args };
+}
+
+/**
+ * Files this call touches, for ACP's `locations`.
+ *
+ * A client that wants to enrich a tool card — "this wrote src/app.ts" — has to
+ * learn the path from somewhere, and `rawInput` is an opaque blob by contract.
+ * `locations` is the field meant for it.
+ */
+function toolLocations(args: unknown): Array<{ path: string; line?: number }> {
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
+  const out: Array<{ path: string; line?: number }> = [];
+  if (typeof a['path'] === 'string' && a['path']) out.push({ path: a['path'] });
+  if (typeof a['file'] === 'string' && a['file']) out.push({ path: a['file'] });
+  return out;
+}
+
+/**
+ * A `diff` content block for a write, so the client shows the change.
+ *
+ * ACP has three content shapes: text, diff, terminal. Reporting a write as a
+ * text blob ("wrote 412 bytes") throws away the two strings a client needs to
+ * render side-by-side, so writes get a real diff instead.
+ *
+ * `oldText` is omitted for a new file — the schema says null means "did not
+ * exist", which is exactly right here because we do not read the previous
+ * contents (nothing in the tool result carries them).
+ */
+function buildDiffContent(
+  toolName: string,
+  args: unknown,
+  ok: boolean,
+): Record<string, unknown> | null {
+  if (!ok) return null;
+  if (toolName !== 'file_write') return null;
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
+  const path = typeof a['path'] === 'string' ? a['path'] : '';
+  const newText = typeof a['content'] === 'string' ? a['content'] : '';
+  if (!path) return null;
+  return { type: 'diff', path, newText };
 }
 
 /** Flatten ACP prompt content blocks into text + attachments. */function extractContent(blocks: unknown): { text: string; attachments: TurnAttachment[] } {

@@ -1,6 +1,6 @@
 ﻿{
   "name": "quick-acp",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "ACP agent that bridges AWS Quick (Quickwork) Claude quota to standard ACP clients",
   "license": "MIT",
