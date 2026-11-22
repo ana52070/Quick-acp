@@ -19,6 +19,11 @@
     "quick-acp": "dist/main.js",
     "quick-acp-login": "dist/login-cli.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=22"
   },
