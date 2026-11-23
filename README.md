@@ -6,6 +6,7 @@
 [![npm version](https://img.shields.io/badge/npm-0.1.8-blue.svg)](https://www.npmjs.com/package/quick-acp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/Node-%3E%3D22-blue.svg)](package.json)
+[![Community](https://img.shields.io/badge/Community-LINUX%20DO-orange?logo=linux)](https://linux.do/)
 
 Quick-acp 是一个将 **AWS Quick (Quickwork)** 的 Claude 配额与推理能力，桥接到任何标准 **ACP (Agent Client Protocol)** 编辑器（如 **[codeg](https://github.com/xintaofei/codeg)**、**[T3 Code](https://t3.codes)**、**[Zed](https://zed.dev)** 等）的本地执行代理。同时为上游 Quick 补充了客户端所需的本地 Shell 执行、文件读写及多模态图片交互能力。
 
@@ -360,6 +361,18 @@ Local ACP command 只有一个 Executable 输入框，而 T3 在 Windows 上会�
 - 使用本项目可能与你所在组织或 AWS Quick 的服务条款存在冲突（例如以非官方客户端访问额度）。**使用前请自行确认合规性，风险自负。**
 - 本项目按「现状」提供，不附带任何明示或暗示的担保。因使用本项目造成的任何直接或间接损失，作者与贡献者不承担责任。
 - 模型生成的命令与文件改动由模型判断产生，请自行复核后再执行不可逆操作。
+
+---
+
+## 致谢
+
+特别鸣谢 **[LINUX DO](https://linux.do/)** 社区及其热心佬友们的支持与启发！
+
+*Special thanks to the **[LINUX DO](https://linux.do/)** community for inspiration and support!*
+
+同作者的其他项目：
+
+- **[LocalTimeTzClock](https://github.com/ana52070/LocalTimeTzClock)** —— 为 Windows 11 原生任务栏时钟显示任意自定义时区，保持系统全局时区与时间戳不受影响。发布包仅 38 KB，Explorer 内常驻 36 KB。
 
 ---
 
